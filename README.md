@@ -16,6 +16,51 @@ python -m pip install -r requirements.txt
 python detector.py --calibrate
 ```
 
+หากใช้จอที่สอง ให้ตรวจหมายเลขจอและ calibrate บนจอ 2:
+
+```powershell
+python detector.py --list-monitors
+python detector.py --calibrate --monitor 2
+```
+
+หมายเลขจอจะถูกบันทึกใน `config.json` จากนั้นรัน `python detector.py` ได้ตามปกติ โปรแกรมจะชดเชยตำแหน่งจอสำหรับการคลิกเมาส์ให้อัตโนมัติ
+
+## ใช้ ADB โดยไม่ขยับเมาส์
+
+เปิด ADB debugging ใน LDPlayer แล้วตรวจ device:
+
+```powershell
+python detector.py --list-adb-devices
+```
+
+จากนั้น calibrate ใหม่จากภาพ Android โดยตรง:
+
+```powershell
+python detector.py --calibrate --backend adb
+```
+
+ถ้ามีหลาย LDPlayer instances ให้เลือก serial:
+
+```powershell
+python detector.py --calibrate --backend adb --adb-device 127.0.0.1:5555
+```
+
+หลัง calibrate ให้รัน `python detector.py` ตามปกติ ค่า backend และ serial จะถูกอ่านจาก `config.json` โหมด ADB ใช้ `screencap` และ `input tap` ภายใน emulator จึงไม่ขยับเมาส์ Windows และไม่ขึ้นกับว่า LDPlayer อยู่จอใด หาก ADB เชื่อมไม่ได้ โปรแกรมจะหยุดและไม่ fallback ไปใช้เมาส์
+
+## เล่น LDPlayer Macro ผ่าน ADB
+
+อย่าเปิด playback จาก Operation Recorder พร้อมกัน ให้โปรแกรมเล่นไฟล์ `.record` แทน:
+
+```powershell
+python detector.py --macro-file "ด่าน 3.record"
+```
+
+ชื่อไฟล์แบบ relative จะอ่านจาก `C:\LDPlayer\LDPlayer14\vms\operationRecords` และวนซ้ำอัตโนมัติ หากต้องการเล่นรอบเดียวใช้ `--macro-once` โปรแกรมรองรับ touch, hold และ swipe; operation ประเภทอื่น เช่น clipboard จะถูกข้าม
+
+พิกัดในไฟล์ `.record` ถูกเก็บเป็น `พิกเซล × 12` โปรแกรมจะหารด้วย 12 แล้วสเกลจาก `resolutionWidth/Height` ที่บันทึกไว้ไปยังความละเอียด ADB ปัจจุบัน จึงเล่นตำแหน่งเดียวกับ Operation Recorder แม้ความละเอียดเปลี่ยน
+
+เมื่อพบการ์ด 5/6 ใบหรือ Confirm ตัวเล่น macro จะ pause timeline ทันที หลังฉากเหล่านี้หายต่อเนื่อง 0.5 วินาที จะ resume จาก operation และเวลาจุดเดิม โดยทุก touch ส่งผ่าน ADB และไม่ขยับเมาส์
+
 ลากกรอบเฉพาะบริเวณรวมของการ์ดทั้ง 6 ช่องตามเส้นแดงในภาพ ตั้งแต่ขอบการ์ดซ้ายบนถึงขอบการ์ดขวาล่าง แล้วกด Enter หากย้ายหรือปรับขนาด LDPlayer ให้ตั้งกรอบใหม่
 
 ## ใช้งาน
@@ -44,9 +89,18 @@ python detector.py
 python detector.py --confirm-template "C:\path\to\confirm.png"
 ```
 
+ตั้งภาพต้นแบบของปุ่ม `Cancel` (ไฟล์ค่าเริ่มต้นคือ `cancel_template.png`):
+
+```powershell
+python detector.py --cancel-template "C:\path\to\cancel.png"
+```
+
+ตัวตรวจจะเทียบข้อความสีขาวกลางปุ่มแทนสีหรือทรงปุ่ม ตรวจ Cancel ก่อน Confirm
+ทุกเฟรม และกด Cancel เพียงครั้งเดียวจนกว่าปุ่มจะหาย หากใช้ ADB การกดจะไม่ขยับเมาส์จริง
+
 เมื่อปุ่มที่ตรงกับภาพต้นแบบปรากฏใกล้บริเวณมินิเกม โปรแกรมจะคลิกทันทีตั้งแต่เฟรมแรก โปรแกรมจะไม่กดปุ่มสีเขียวอื่นที่ไม่ตรงกับคำว่า `Confirm`
 
-เกณฑ์จับคู่ภาพต้นแบบ Confirm คือ 0.40 ขึ้นไป
+เกณฑ์จับคู่ข้อความของปุ่ม Confirm และ Cancel คือ 0.82 ขึ้นไป
 
 ตัวเลือกเพิ่มเติม:
 

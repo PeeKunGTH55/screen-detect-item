@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import shutil
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,31 +20,302 @@ import pyautogui
 
 CONFIG = Path(__file__).with_name("config.json")
 CONFIRM_TEMPLATE = Path(__file__).with_name("confirm_template.png")
+CANCEL_TEMPLATE = Path(__file__).with_name("cancel_template.png")
 TRAINING_DIR = Path(__file__).with_name("training_data")
 TRAINING_FILE = TRAINING_DIR / "samples.npz"
 MAX_SAMPLES_PER_CLASS = 250
 ODD_DUPLICATE_DISTANCE = 0.10
 REQUIRED_STABLE_FRAMES = 3
+DEFAULT_ADB_PATH = Path(r"C:\LDPlayer\LDPlayer14\adb.exe")
+ADB_TIMEOUT = 5.0
+OPERATION_RECORDS_DIR = Path(r"C:\LDPlayer\LDPlayer14\vms\operationRecords")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
-def grab_screen() -> np.ndarray:
+def grab_screen(monitor_index: int) -> tuple[np.ndarray, int, int]:
     with mss.mss() as camera:
-        monitor = camera.monitors[1]
-        return np.asarray(camera.grab(monitor))[:, :, :3].copy()
+        if monitor_index < 1 or monitor_index >= len(camera.monitors):
+            available = len(camera.monitors) - 1
+            raise SystemExit(f"ไม่พบจอ {monitor_index}; ระบบพบจอทั้งหมด {available} จอ")
+        monitor = camera.monitors[monitor_index]
+        frame = np.asarray(camera.grab(monitor))[:, :, :3].copy()
+        return frame, int(monitor["left"]), int(monitor["top"])
 
 
-def calibrate() -> None:
-    frame = grab_screen()
+def list_monitors() -> None:
+    with mss.mss() as camera:
+        for index, monitor in enumerate(camera.monitors[1:], start=1):
+            print(
+                f"monitor {index}: {monitor['width']}x{monitor['height']} "
+                f"at ({monitor['left']}, {monitor['top']})"
+            )
+
+
+def find_adb_path() -> Path:
+    if DEFAULT_ADB_PATH.exists():
+        return DEFAULT_ADB_PATH
+    discovered = shutil.which("adb")
+    if discovered:
+        return Path(discovered)
+    raise SystemExit("ไม่พบ adb.exe; คาดว่าจะอยู่ที่ C:\\LDPlayer\\LDPlayer14\\adb.exe")
+
+
+def run_adb(arguments: list[str], serial: str | None = None, timeout: float = ADB_TIMEOUT) -> bytes:
+    command = [str(find_adb_path())]
+    if serial:
+        command += ["-s", serial]
+    command += arguments
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit("ADB ไม่ตอบสนองภายใน 5 วินาที กรุณาเปิด ADB debugging ใน LDPlayer") from error
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail or f"ADB exit code {result.returncode}")
+    return result.stdout
+
+
+def adb_devices() -> list[tuple[str, str]]:
+    try:
+        output = run_adb(["devices", "-l"]).decode("utf-8", errors="replace")
+    except RuntimeError as error:
+        raise SystemExit(f"อ่านรายการ ADB ไม่สำเร็จ: {error}") from error
+    devices = []
+    for line in output.splitlines()[1:]:
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            devices.append((parts[0], parts[1]))
+    return devices
+
+
+def list_adb_devices() -> None:
+    devices = adb_devices()
+    if not devices:
+        print("ไม่พบ ADB device — เปิด ADB debugging ใน LDPlayer แล้วลองใหม่")
+        return
+    for serial, state in devices:
+        print(f"{serial}: {state}")
+
+
+def resolve_adb_device(requested: str | None) -> str:
+    devices = adb_devices()
+    online = [serial for serial, state in devices if state == "device"]
+    if requested:
+        states = {serial: state for serial, state in devices}
+        if requested not in states:
+            raise SystemExit(f"ไม่พบ ADB device: {requested}")
+        if states[requested] != "device":
+            raise SystemExit(f"ADB device {requested} มีสถานะ {states[requested]}")
+        return requested
+    if not online:
+        raise SystemExit("ไม่พบ ADB device ที่พร้อมใช้งาน กรุณาเปิด ADB debugging ใน LDPlayer")
+    if len(online) > 1:
+        choices = ", ".join(online)
+        raise SystemExit(f"พบหลาย ADB devices ({choices}); กรุณาระบุ --adb-device SERIAL")
+    return online[0]
+
+
+class ScreenBackend:
+    name = "screen"
+
+    def __init__(self, monitor_index: int) -> None:
+        self.monitor_index = monitor_index
+        grab_screen(monitor_index)  # Validate before entering the main loop.
+
+    def grab(self) -> np.ndarray:
+        frame, self.left, self.top = grab_screen(self.monitor_index)
+        return frame
+
+    def tap(self, x: int, y: int) -> None:
+        pyautogui.click(self.left + x, self.top + y, duration=0.06)
+
+
+class AdbBackend:
+    name = "adb"
+
+    def __init__(self, requested_serial: str | None) -> None:
+        self.serial = resolve_adb_device(requested_serial)
+        self.grab()  # Validate screenshot/decode before entering the main loop.
+
+    def grab(self) -> np.ndarray:
+        try:
+            png = run_adb(["exec-out", "screencap", "-p"], self.serial)
+        except RuntimeError as error:
+            raise SystemExit(f"จับภาพผ่าน ADB ไม่สำเร็จ: {error}") from error
+        frame = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise SystemExit("ADB ส่งภาพหน้าจอที่ decode ไม่ได้")
+        self.height, self.width = frame.shape[:2]
+        return frame
+
+    def tap(self, x: int, y: int) -> None:
+        try:
+            run_adb(["shell", "input", "tap", str(x), str(y)], self.serial)
+        except RuntimeError as error:
+            raise SystemExit(f"ส่ง ADB tap ไม่สำเร็จ: {error}") from error
+
+    def gesture(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int) -> None:
+        if abs(x2 - x1) < 3 and abs(y2 - y1) < 3 and duration_ms < 300:
+            self.tap(x1, y1)
+            return
+        try:
+            run_adb(
+                ["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(max(1, duration_ms))],
+                self.serial,
+            )
+        except RuntimeError as error:
+            raise SystemExit(f"ส่ง ADB gesture ไม่สำเร็จ: {error}") from error
+
+
+class AdbMacroRunner:
+    """Replay an LDPlayer .record file with a pausable ADB timeline."""
+
+    def __init__(self, path: Path, backend: AdbBackend, loop: bool) -> None:
+        self.path = path
+        self.backend = backend
+        self.loop = loop
+        self.paused = threading.Event()
+        self.stopped = threading.Event()
+        self.error: BaseException | None = None
+        self.absent_since: float | None = None
+        self.actions, self.cycle_ms, self.record_width, self.record_height = self._load(path)
+        self.thread = threading.Thread(target=self._run, name="adb-macro", daemon=True)
+        atexit.register(self.stop)
+
+    @staticmethod
+    def _load(path: Path) -> tuple[list[tuple[int, int, int, int, int, int]], int, int, int]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"อ่าน macro ไม่สำเร็จ: {path} ({error})") from error
+        downs: dict[int, tuple[int, int, int]] = {}
+        actions = []
+        ignored = set()
+        for operation in data.get("operations", []):
+            operation_id = operation.get("operationId")
+            if operation_id != "PutMultiTouch":
+                ignored.add(str(operation_id))
+                continue
+            timing = int(operation.get("timing", 0))
+            for point in operation.get("points", []):
+                touch_id = int(point.get("id", 0))
+                state = int(point.get("state", -1))
+                if state == 1:
+                    downs[touch_id] = (timing, int(point["x"]), int(point["y"]))
+                elif state == 0 and touch_id in downs:
+                    start_ms, x1, y1 = downs.pop(touch_id)
+                    actions.append((start_ms, x1, y1, int(point["x"]), int(point["y"]), max(1, timing - start_ms)))
+        actions.sort(key=lambda item: item[0])
+        if ignored:
+            print(f"Macro: ข้าม operations ที่ไม่ใช่ touch: {', '.join(sorted(ignored))}")
+        if not actions:
+            raise SystemExit(f"macro ไม่มี touch operations: {path}")
+        info = data.get("recordInfo", {})
+        record_width = int(info.get("resolutionWidth", 0))
+        record_height = int(info.get("resolutionHeight", 0))
+        if record_width <= 0 or record_height <= 0:
+            raise SystemExit(f"macro ไม่มี resolution ที่ถูกต้อง: {path}")
+        cycle_ms = max(int(info.get("circleDuration", 0)), actions[-1][0] + actions[-1][5])
+        return actions, cycle_ms, record_width, record_height
+
+    def start(self) -> None:
+        print(
+            f"เริ่ม ADB macro: {self.path.name} ({len(self.actions)} gestures, "
+            f"recorded {self.record_width}x{self.record_height}, device {self.backend.width}x{self.backend.height})"
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        self.paused.clear()
+
+    def set_paused(self, value: bool) -> None:
+        before = self.paused.is_set()
+        if value:
+            self.paused.set()
+        else:
+            self.paused.clear()
+        if before != value:
+            print("Pause ADB macro" if value else "Resume ADB macro")
+
+    def observe_scene(self, cards_or_confirm_visible: bool) -> None:
+        if cards_or_confirm_visible:
+            self.absent_since = None
+            self.set_paused(True)
+        elif self.paused.is_set():
+            if self.absent_since is None:
+                self.absent_since = time.monotonic()
+            elif time.monotonic() - self.absent_since >= 0.5:
+                self.set_paused(False)
+
+    def _wait_until_active(
+        self, target_seconds: float, cycle_start: float, paused_total: float
+    ) -> tuple[bool, float]:
+        while not self.stopped.is_set():
+            if self.paused.is_set():
+                pause_started = time.monotonic()
+                while self.paused.is_set() and not self.stopped.is_set():
+                    time.sleep(0.01)
+                paused_total += time.monotonic() - pause_started
+                continue
+            elapsed = time.monotonic() - cycle_start - paused_total
+            remaining = target_seconds - elapsed
+            if remaining <= 0:
+                return True, paused_total
+            time.sleep(min(0.01, remaining))
+        return False, paused_total
+
+    def _run(self) -> None:
+        try:
+            while not self.stopped.is_set():
+                cycle_start = time.monotonic()
+                paused_total = 0.0
+                for timing, x1, y1, x2, y2, duration in self.actions:
+                    ready, paused_total = self._wait_until_active(timing / 1000.0, cycle_start, paused_total)
+                    if not ready:
+                        return
+                    # LDPlayer .record stores touch coordinates as pixel * 12.
+                    # Scale from the recorded resolution to the current ADB resolution.
+                    sx = self.backend.width / (self.record_width * 12.0)
+                    sy = self.backend.height / (self.record_height * 12.0)
+                    self.backend.gesture(
+                        round(x1 * sx), round(y1 * sy), round(x2 * sx), round(y2 * sy), duration
+                    )
+                if not self.loop:
+                    return
+                ready, _ = self._wait_until_active(self.cycle_ms / 1000.0, cycle_start, paused_total)
+                if not ready:
+                    return
+        except BaseException as error:
+            self.error = error
+            self.stopped.set()
+
+
+def make_backend(name: str, monitor_index: int, adb_device: str | None):
+    if name == "adb":
+        return AdbBackend(adb_device)
+    return ScreenBackend(monitor_index)
+
+
+def calibrate(backend_name: str, monitor_index: int, adb_device: str | None) -> None:
+    backend = make_backend(backend_name, monitor_index, adb_device)
+    frame = backend.grab()
     title = "ลากกรอบคลุมการ์ดทั้ง 6 ช่องตามเส้นแดง แล้วกด ENTER"
     x, y, w, h = map(int, cv2.selectROI(title, frame, False, False))
     cv2.destroyAllWindows()
     if w < 100 or h < 100:
         raise SystemExit("ยกเลิกการตั้งค่า")
     screen_h, screen_w = frame.shape[:2]
-    config = {"grid": [x / screen_w, y / screen_h, w / screen_w, h / screen_h]}
+    config = {
+        "backend": backend_name,
+        "grid": [x / screen_w, y / screen_h, w / screen_w, h / screen_h],
+    }
+    if backend_name == "adb":
+        config["adb_device"] = backend.serial
+    else:
+        config["monitor"] = monitor_index
     CONFIG.write_text(json.dumps(config, indent=2), encoding="utf-8")
     print(f"บันทึกพื้นที่ตรวจจับแล้ว: {CONFIG}")
 
@@ -55,6 +329,17 @@ def save_confirm_template(source: str) -> None:
     if not cv2.imwrite(str(CONFIRM_TEMPLATE), image):
         raise SystemExit("บันทึกภาพต้นแบบ Confirm ไม่สำเร็จ")
     print(f"บันทึกภาพต้นแบบ Confirm แล้ว: {CONFIRM_TEMPLATE}")
+
+
+def save_cancel_template(source: str) -> None:
+    image = cv2.imread(source)
+    if image is None:
+        raise SystemExit(f"อ่านภาพปุ่มไม่ได้: {source}")
+    if image.shape[0] < 30 or image.shape[1] < 80:
+        raise SystemExit("ภาพปุ่มมีขนาดเล็กเกินไป")
+    if not cv2.imwrite(str(CANCEL_TEMPLATE), image):
+        raise SystemExit("บันทึกภาพต้นแบบ Cancel ไม่สำเร็จ")
+    print(f"บันทึกภาพต้นแบบ Cancel แล้ว: {CANCEL_TEMPLATE}")
 
 
 def card_boxes(frame: np.ndarray, grid: list[float]) -> list[tuple[int, int, int, int]]:
@@ -86,11 +371,11 @@ def active_card_indices(frame: np.ndarray, boxes: list[tuple[int, int, int, int]
     return active
 
 
-def find_confirm_button(
-    frame: np.ndarray, grid: list[float]
+def find_button(
+    frame: np.ndarray, grid: list[float], template_path: Path, threshold: float = 0.82
 ) -> tuple[int, int, int, int] | None:
-    """Find the saved Confirm button using multi-scale edge template matching."""
-    if not CONFIRM_TEMPLATE.exists():
+    """Find a button by its white centre text, not its colour or outer shape."""
+    if not template_path.exists():
         return None
     screen_h, screen_w = frame.shape[:2]
     gx, gy, gw, gh = grid
@@ -100,26 +385,52 @@ def find_confirm_button(
     x2 = min(screen_w, int(gx + gw * 1.45))
     y2 = min(screen_h, int(gy + gh * 1.25))
     search = frame[y1:y2, x1:x2]
-    template = cv2.imread(str(CONFIRM_TEMPLATE))
+    template = cv2.imread(str(template_path))
     if template is None:
         return None
-    search_edge = cv2.Canny(cv2.cvtColor(search, cv2.COLOR_BGR2GRAY), 60, 150)
+    template_h, template_w = template.shape[:2]
+    crop_left, crop_right = int(template_w * 0.16), int(template_w * 0.84)
+    crop_top, crop_bottom = int(template_h * 0.22), int(template_h * 0.88)
+    text_template = template[crop_top:crop_bottom, crop_left:crop_right]
+
+    def white_text_mask(image: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        return (((hsv[:, :, 1] < 70) & (hsv[:, :, 2] > 185)) * 255).astype(np.uint8)
+
+    search_mask = white_text_mask(search)
+    template_mask = white_text_mask(text_template)
+    if cv2.countNonZero(template_mask) < 20:
+        return None
     best_score, best_box = 0.0, None
-    # Allow LDPlayer/window scaling while still requiring the exact word/outline.
+    # Allow emulator resolution scaling while requiring the exact word pattern.
     for scale in np.linspace(0.60, 1.45, 18):
-        tw = int(template.shape[1] * scale)
-        th = int(template.shape[0] * scale)
-        if tw < 60 or th < 25 or tw > search.shape[1] or th > search.shape[0]:
+        text_w = int(text_template.shape[1] * scale)
+        text_h = int(text_template.shape[0] * scale)
+        if text_w < 40 or text_h < 20 or text_w > search.shape[1] or text_h > search.shape[0]:
             continue
-        resized = cv2.resize(template, (tw, th), interpolation=cv2.INTER_AREA)
-        template_edge = cv2.Canny(cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY), 60, 150)
-        result = cv2.matchTemplate(search_edge, template_edge, cv2.TM_CCOEFF_NORMED)
+        resized = cv2.resize(template_mask, (text_w, text_h), interpolation=cv2.INTER_NEAREST)
+        result = cv2.matchTemplate(search_mask, resized, cv2.TM_CCOEFF_NORMED)
         _, score, _, location = cv2.minMaxLoc(result)
         if score > best_score:
             best_score = float(score)
-            bx, by = location
-            best_box = (x1 + bx, y1 + by, x1 + bx + tw, y1 + by + th)
-    return best_box if best_score >= 0.40 else None
+            text_x, text_y = location
+            button_x = x1 + text_x - int(crop_left * scale)
+            button_y = y1 + text_y - int(crop_top * scale)
+            button_w = int(template_w * scale)
+            button_h = int(template_h * scale)
+            best_box = (
+                max(0, button_x), max(0, button_y),
+                min(screen_w, button_x + button_w), min(screen_h, button_y + button_h),
+            )
+    return best_box if best_score >= threshold else None
+
+
+def find_cancel_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
+    return find_button(frame, grid, CANCEL_TEMPLATE)
+
+
+def find_confirm_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
+    return find_button(frame, grid, CONFIRM_TEMPLATE)
 
 
 def feature(crop: np.ndarray) -> np.ndarray:
@@ -240,27 +551,83 @@ def update_stability(
     return current_slot, 1
 
 
-def run(click: bool, interval: float, delay: float, show: bool, learning_enabled: bool) -> None:
+def run(
+    click: bool,
+    interval: float,
+    delay: float,
+    show: bool,
+    learning_enabled: bool,
+    monitor_override: int | None,
+    backend_override: str | None,
+    adb_device_override: str | None,
+    macro_file: str | None,
+    macro_once: bool,
+) -> None:
     if not CONFIG.exists():
         raise SystemExit("ยังไม่ได้ตั้งพื้นที่ กรุณารัน: python detector.py --calibrate")
     saved = json.loads(CONFIG.read_text(encoding="utf-8"))
     if "grid" not in saved:
         raise SystemExit("กรุณาตั้งกรอบแบบใหม่: python detector.py --calibrate")
     grid = saved["grid"]
+    monitor_index = monitor_override or int(saved.get("monitor", 1))
+    saved_backend = saved.get("backend", "screen")
+    if backend_override and backend_override != saved_backend:
+        raise SystemExit(
+            f"config ถูก calibrate สำหรับ {saved_backend}; กรุณารัน "
+            f"python detector.py --calibrate --backend {backend_override}"
+        )
+    backend_name = backend_override or saved_backend
+    adb_device = adb_device_override or saved.get("adb_device")
+    backend = make_backend(backend_name, monitor_index, adb_device)
     last_click, previous_count, ready_at = 0.0, 0, 0.0
     learning = LearningStore(learning_enabled)
+    macro = None
+    if macro_file:
+        if not isinstance(backend, AdbBackend):
+            raise SystemExit("--macro-file ใช้ได้เฉพาะ backend adb")
+        macro_path = Path(macro_file)
+        if not macro_path.is_absolute():
+            macro_path = OPERATION_RECORDS_DIR / macro_path
+        if not macro_path.exists():
+            raise SystemExit(f"ไม่พบ macro file: {macro_path}")
+        macro = AdbMacroRunner(macro_path, backend, loop=not macro_once)
+        macro.start()
     pending = None
     candidate_slot, stable_frames = None, 0
-    pyautogui.FAILSAFE = True
-    print("เริ่มตรวจจับแล้ว — เลื่อนเมาส์ไปมุมซ้ายบนเพื่อหยุดฉุกเฉิน หรือกด Q ในหน้าต่าง Preview")
+    cancel_latched = False
+    if backend_name == "screen":
+        pyautogui.FAILSAFE = True
+        print("เริ่ม screen backend — เลื่อนเมาส์ไปมุมซ้ายบนเพื่อหยุดฉุกเฉิน หรือกด Q")
+    else:
+        print(f"เริ่ม ADB backend ({backend.serial}) — เมาส์จริงจะไม่ถูกขยับ; กด Q เพื่อหยุด")
     while True:
-        frame = grab_screen()
+        if macro and macro.error:
+            raise SystemExit(f"ADB macro หยุดเพราะข้อผิดพลาด: {macro.error}")
+        frame = backend.grab()
+        cancel = find_cancel_button(frame, grid)
+        if cancel:
+            if macro:
+                macro.observe_scene(True)
+            candidate_slot, stable_frames = None, 0
+            if not cancel_latched:
+                x1, y1, x2, y2 = cancel
+                if click:
+                    backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
+                    print("คลิกปุ่ม Cancel")
+                last_click = time.time()
+                cancel_latched = True
+            time.sleep(interval)
+            continue
+        cancel_latched = False
+
         confirm = find_confirm_button(frame, grid)
         if confirm and time.time() - last_click > 0.30:
+            if macro:
+                macro.observe_scene(True)
             candidate_slot, stable_frames = None, 0
             x1, y1, x2, y2 = confirm
             if click:
-                pyautogui.click((x1 + x2) // 2, (y1 + y2) // 2, duration=0.06)
+                backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
                 print("คลิกปุ่ม Confirm")
             last_click = time.time()
             time.sleep(interval)
@@ -269,6 +636,8 @@ def run(click: bool, interval: float, delay: float, show: bool, learning_enabled
         boxes = card_boxes(frame, grid)
         active_indices = active_card_indices(frame, boxes)
         active_count = len(active_indices)
+        if macro:
+            macro.observe_scene(active_count in (5, 6))
 
         if pending is not None:
             clicked_slot = pending["slot"]
@@ -306,8 +675,9 @@ def run(click: bool, interval: float, delay: float, show: bool, learning_enabled
         confidence = float(scores[candidate_pos])
         if click and stable_frames >= REQUIRED_STABLE_FRAMES and time.time() - last_click > 0.30:
             x1, y1, x2, y2 = boxes[candidate]
-            click_x, click_y = (x1 + x2) // 2, (y1 + y2) // 2
-            pyautogui.click(click_x, click_y, duration=0.06)
+            click_x = (x1 + x2) // 2
+            click_y = (y1 + y2) // 2
+            backend.tap(click_x, click_y)
             print(f"คลิกใบที่ {candidate + 1} (ความมั่นใจ {confidence:.3f})")
             last_click = time.time()
             pending = {
@@ -340,12 +710,22 @@ def run(click: bool, interval: float, delay: float, show: bool, learning_enabled
                 break
         time.sleep(interval)
     cv2.destroyAllWindows()
+    if macro:
+        macro.stop()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ตรวจจับการ์ดที่ต่างจากการ์ดส่วนใหญ่")
     parser.add_argument("--calibrate", action="store_true", help="เลือกกรอบรวมของการ์ด 6 ช่อง")
+    parser.add_argument("--backend", choices=("screen", "adb"), help="แหล่งภาพและวิธีคลิก")
+    parser.add_argument("--monitor", type=int, help="หมายเลขจอที่ต้องการใช้ เช่น 1 หรือ 2")
+    parser.add_argument("--list-monitors", action="store_true", help="แสดงจอที่ตรวจพบ")
+    parser.add_argument("--adb-device", help="ADB serial สำหรับเลือก LDPlayer instance")
+    parser.add_argument("--list-adb-devices", action="store_true", help="แสดง ADB devices ที่ตรวจพบ")
+    parser.add_argument("--macro-file", help="ไฟล์ .record ที่ให้โปรแกรมเล่นผ่าน ADB")
+    parser.add_argument("--macro-once", action="store_true", help="เล่น macro รอบเดียวแทนการวนซ้ำ")
     parser.add_argument("--confirm-template", metavar="IMAGE", help="บันทึกภาพปุ่ม Confirm เป็นต้นแบบ")
+    parser.add_argument("--cancel-template", metavar="IMAGE", help="บันทึกภาพปุ่ม Cancel เป็นต้นแบบ")
     parser.add_argument("--dry-run", action="store_true", help="แสดงผลอย่างเดียว ไม่คลิกจริง")
     parser.add_argument("--no-preview", action="store_true", help="ไม่แสดงหน้าต่างตรวจสอบ")
     parser.add_argument("--interval", type=float, default=0.08, help="เวลาระหว่างเฟรม (วินาที)")
@@ -357,16 +737,33 @@ def main() -> None:
     parser.add_argument("--reset-learning", action="store_true", help="ล้างข้อมูลเรียนรู้ทั้งหมด")
     parser.add_argument("--learning-stats", action="store_true", help="แสดงจำนวนตัวอย่างที่เรียนรู้")
     args = parser.parse_args()
-    if args.reset_learning:
+    if args.list_monitors:
+        list_monitors()
+    elif args.list_adb_devices:
+        list_adb_devices()
+    elif args.reset_learning:
         reset_learning()
     elif args.learning_stats:
         print_learning_stats()
     elif args.confirm_template:
         save_confirm_template(args.confirm_template)
+    elif args.cancel_template:
+        save_cancel_template(args.cancel_template)
     elif args.calibrate:
-        calibrate()
+        calibrate(args.backend or "screen", args.monitor or 1, args.adb_device)
     else:
-        run(not args.dry_run, args.interval, args.delay, not args.no_preview, args.learning)
+        run(
+            not args.dry_run,
+            args.interval,
+            args.delay,
+            not args.no_preview,
+            args.learning,
+            args.monitor,
+            args.backend,
+            args.adb_device,
+            args.macro_file,
+            args.macro_once,
+        )
 
 
 if __name__ == "__main__":
