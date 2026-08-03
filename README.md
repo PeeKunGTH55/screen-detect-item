@@ -60,9 +60,8 @@ python detector.py --delay 0.7
 
 ```powershell
 python detector.py --learning-stats
-python detector.py --show-learning
 python detector.py --no-learning
 python detector.py --reset-learning
 ```
 
-หลังยืนยันว่าคลิกถูก ภาพครอปจริงจะถูกเก็บใน `training_data/odd/` คำสั่ง `--show-learning` จะแสดง odd ล่าสุดเป็นตาราง ระบบจะข้ามภาพใหม่หากซ้ำกับ odd เดิมมากเกินไป
+ระบบบันทึกเฉพาะ feature ลง `training_data/samples.npz` และไม่บันทึกไฟล์ภาพ PNG ระบบจะข้ามตัวอย่างใหม่หากซ้ำกับ odd เดิมมากเกินไป

@@ -19,8 +19,6 @@ CONFIG = Path(__file__).with_name("config.json")
 CONFIRM_TEMPLATE = Path(__file__).with_name("confirm_template.png")
 TRAINING_DIR = Path(__file__).with_name("training_data")
 TRAINING_FILE = TRAINING_DIR / "samples.npz"
-ODD_IMAGE_DIR = TRAINING_DIR / "odd"
-NORMAL_IMAGE_DIR = TRAINING_DIR / "normal"
 MAX_SAMPLES_PER_CLASS = 250
 ODD_DUPLICATE_DISTANCE = 0.10
 REQUIRED_STABLE_FRAMES = 3
@@ -164,17 +162,7 @@ class LearningStore:
                 unique.append(sample)
         return np.asarray(unique, dtype=np.float32) if unique else samples[:0]
 
-    @staticmethod
-    def _save_images(directory: Path, images: list[np.ndarray], prefix: str) -> None:
-        directory.mkdir(parents=True, exist_ok=True)
-        stamp = time.time_ns()
-        for index, image in enumerate(images):
-            cv2.imwrite(str(directory / f"{prefix}_{stamp}_{index:02d}.png"), image)
-        files = sorted(directory.glob("*.png"), key=lambda path: path.stat().st_mtime_ns)
-        for old_file in files[:-MAX_SAMPLES_PER_CLASS]:
-            old_file.unlink()
-
-    def add_odd(self, odd: np.ndarray, odd_image: np.ndarray) -> None:
+    def add_odd(self, odd: np.ndarray) -> None:
         if not self.enabled:
             return
         nearest = self._closest(odd, self.odd)
@@ -187,7 +175,6 @@ class LearningStore:
         with temp.open("wb") as handle:
             np.savez_compressed(handle, normal=self.normal.astype(np.float16), odd=self.odd.astype(np.float16))
         temp.replace(TRAINING_FILE)
-        self._save_images(ODD_IMAGE_DIR, [odd_image], "odd")
         print(f"เรียนรู้ odd ใหม่แล้ว: odd={len(self.odd)}")
 
     @staticmethod
@@ -217,32 +204,6 @@ def print_learning_stats() -> None:
     store = LearningStore(True)
     size = TRAINING_FILE.stat().st_size if TRAINING_FILE.exists() else 0
     print(f"odd_used={len(store.odd)}, normal_ignored={len(store.normal)}, file={size:,} bytes")
-
-
-def show_learning_images() -> None:
-    entries = [("ODD", path) for path in sorted(ODD_IMAGE_DIR.glob("*.png"))[-48:]]
-    if not entries:
-        raise SystemExit("ยังไม่มีภาพที่เรียนรู้ ภาพจะถูกบันทึกหลังคลิกถูกครั้งถัดไป")
-    tiles = []
-    for label, path in entries:
-        image = cv2.imread(str(path))
-        if image is None:
-            continue
-        tile = cv2.resize(image, (180, 220), interpolation=cv2.INTER_AREA)
-        color = (0, 0, 255)
-        cv2.rectangle(tile, (0, 0), (179, 219), color, 4)
-        cv2.putText(tile, label, (8, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        tiles.append(tile)
-    if not tiles:
-        raise SystemExit("ไม่สามารถอ่านภาพที่เรียนรู้ได้")
-    columns = 6
-    blank = np.full_like(tiles[0], 235)
-    tiles += [blank] * ((-len(tiles)) % columns)
-    rows = [np.hstack(tiles[i:i + columns]) for i in range(0, len(tiles), columns)]
-    sheet = np.vstack(rows)
-    cv2.imshow("Learning samples - press any key to close", sheet)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
 
 
 def find_odd(
@@ -314,7 +275,6 @@ def run(click: bool, interval: float, delay: float, show: bool, learning_enabled
             if clicked_slot not in active_indices:
                 learning.add_odd(
                     pending["descriptors"][clicked_slot],
-                    pending["images"][clicked_slot],
                 )
                 pending = None
             elif time.time() >= pending["deadline"]:
@@ -354,10 +314,6 @@ def run(click: bool, interval: float, delay: float, show: bool, learning_enabled
                 "slot": candidate,
                 "deadline": time.time() + 2.0,
                 "descriptors": {slot: descriptors[pos] for pos, slot in enumerate(active_indices)},
-                "images": {
-                    slot: frame[y1:y2, x1:x2].copy()
-                    for slot, (x1, y1, x2, y2) in zip(active_indices, active_boxes)
-                },
             }
             print(f"กำลังรอยืนยัน odd ช่อง {candidate + 1} (สูงสุด 2 วินาที)")
             candidate_slot, stable_frames = None, 0
@@ -400,12 +356,9 @@ def main() -> None:
     parser.set_defaults(learning=True)
     parser.add_argument("--reset-learning", action="store_true", help="ล้างข้อมูลเรียนรู้ทั้งหมด")
     parser.add_argument("--learning-stats", action="store_true", help="แสดงจำนวนตัวอย่างที่เรียนรู้")
-    parser.add_argument("--show-learning", action="store_true", help="เปิดดูภาพตัวอย่างที่เรียนรู้")
     args = parser.parse_args()
     if args.reset_learning:
         reset_learning()
-    elif args.show_learning:
-        show_learning_images()
     elif args.learning_stats:
         print_learning_stats()
     elif args.confirm_template:
