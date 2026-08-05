@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
+import hashlib
 import json
+import os
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import cv2
@@ -21,8 +27,15 @@ import pyautogui
 CONFIG = Path(__file__).with_name("config.json")
 CONFIRM_TEMPLATE = Path(__file__).with_name("confirm_template.png")
 CANCEL_TEMPLATE = Path(__file__).with_name("cancel_template.png")
+CLOSE_TEMPLATE = Path(__file__).with_name("close_template.png")
+UPGRADE_WINDOW_TEMPLATE = Path(__file__).with_name("upgrade_window_template.png")
 TRAINING_DIR = Path(__file__).with_name("training_data")
 TRAINING_FILE = TRAINING_DIR / "samples.npz"
+PAUSE_CLIPS_DIR = Path(__file__).with_name("pause_clips")
+MAX_PAUSE_CLIPS = 3
+POST_PAUSE_RECORD_SECONDS = 0.3
+OBS_PATH = Path(r"C:\Program Files\obs-studio\bin\64bit\obs64.exe")
+OBS_WEBSOCKET_CONFIG = Path.home() / r"AppData\Roaming\obs-studio\plugin_config\obs-websocket\config.json"
 MAX_SAMPLES_PER_CLASS = 250
 ODD_DUPLICATE_DISTANCE = 0.10
 REQUIRED_STABLE_FRAMES = 3
@@ -293,6 +306,298 @@ class AdbMacroRunner:
             self.stopped.set()
 
 
+class PauseClipRecorder:
+    """Toggle LDPlayer's native recorder with F8 without taking foreground focus."""
+
+    def __init__(self, serial: str) -> None:
+        self.window = self._find_window()
+        self.recording = False
+        self.before_files: dict[Path, tuple[int, int]] = {}
+        self.stamp: str | None = None
+        PAUSE_CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _find_window() -> int:
+        """Return the largest visible top-level dnplayer window."""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+        ]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        process_query_limited_information = 0x1000
+        windows: list[tuple[int, int]] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def visit(hwnd: int, _lparam: int) -> bool:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            process = kernel32.OpenProcess(process_query_limited_information, False, pid.value)
+            if not process:
+                return True
+            try:
+                size = wintypes.DWORD(32768)
+                path = ctypes.create_unicode_buffer(size.value)
+                if not kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size)):
+                    return True
+                if Path(path.value).name.lower() != "dnplayer.exe":
+                    return True
+                rect = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+                windows.append((area, int(hwnd)))
+            finally:
+                kernel32.CloseHandle(process)
+            return True
+
+        user32.EnumWindows(visit, 0)
+        if not windows:
+            raise SystemExit("ไม่พบหน้าต่าง LDPlayer — กรุณาเปิดหน้าต่างไว้และอย่าปิดลง system tray")
+        return max(windows)[1]
+
+    @staticmethod
+    def _send_f8(hwnd: int) -> None:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd):
+            raise RuntimeError("หน้าต่าง LDPlayer ถูกปิดระหว่างทำงาน")
+        vk_f8, wm_keydown, wm_keyup = 0x77, 0x0100, 0x0101
+        scan = user32.MapVirtualKeyW(vk_f8, 0)
+        user32.PostMessageW(hwnd, wm_keydown, vk_f8, 1 | (scan << 16))
+        user32.PostMessageW(hwnd, wm_keyup, vk_f8, 1 | (scan << 16) | 0xC0000000)
+
+    @staticmethod
+    def _video_snapshot() -> dict[Path, tuple[int, int]]:
+        snapshot = {}
+        for directory in LDPLAYER_VIDEO_DIRS:
+            if directory.exists():
+                for path in directory.rglob("*.mp4"):
+                    snapshot[path] = (path.stat().st_mtime_ns, path.stat().st_size)
+        return snapshot
+
+    def record(self, frame: np.ndarray, paused: bool) -> None:
+        if paused:
+            return
+        self.start()
+
+    def start(self) -> None:
+        if not self.recording:
+            if not self.window:
+                self.window = self._find_window()
+            self.before_files = self._video_snapshot()
+            self.stamp = time.strftime("%Y-%m-%d_%H-%M-%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+            self._send_f8(self.window)
+            self.recording = True
+            time.sleep(0.25)
+            print(f"เริ่มอัดคลิปด้วย LDPlayer F8: {self.stamp}")
+
+    def finish(self, reason: str) -> None:
+        if not self.recording or self.stamp is None:
+            return
+        self._send_f8(self.window)
+        self.recording = False
+        final_path = PAUSE_CLIPS_DIR / f"{self.stamp}_{reason}.mp4"
+        deadline = time.monotonic() + 15.0
+        source = None
+        while time.monotonic() < deadline:
+            current = self._video_snapshot()
+            changed = [path for path, state in current.items() if self.before_files.get(path) != state and state[1] > 0]
+            if changed:
+                candidate = max(changed, key=lambda path: path.stat().st_mtime_ns)
+                size_before = candidate.stat().st_size
+                time.sleep(0.3)
+                if candidate.exists() and candidate.stat().st_size == size_before:
+                    source = candidate
+                    break
+            time.sleep(0.15)
+        if source is None:
+            searched = ", ".join(str(path) for path in LDPLAYER_VIDEO_DIRS)
+            raise RuntimeError(f"LDPlayer หยุดอัดแล้วแต่ไม่พบ MP4 ใหม่ใน: {searched}")
+        shutil.move(str(source), str(final_path))
+        self.stamp = None
+        clips = sorted(PAUSE_CLIPS_DIR.glob("*.mp4"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for old_path in clips[MAX_PAUSE_CLIPS:]:
+            old_path.unlink(missing_ok=True)
+        print(f"บันทึกคลิปก่อน pause ({reason}): {final_path}")
+
+
+class ObsClipRecorder:
+    """Control OBS recording through its local WebSocket API."""
+
+    def __init__(self, _serial: str) -> None:
+        if not OBS_WEBSOCKET_CONFIG.exists():
+            raise SystemExit("ไม่พบ config ของ OBS WebSocket")
+        config = json.loads(OBS_WEBSOCKET_CONFIG.read_text(encoding="utf-8-sig"))
+        if not config.get("server_enabled"):
+            raise SystemExit("OBS WebSocket ยังปิดอยู่ — เปิด Tools > WebSocket Server Settings > Enable WebSocket server")
+        self.port = int(config.get("server_port", 4455))
+        self.password = str(config.get("server_password", ""))
+        self.socket: socket.socket | None = None
+        self.recv_buffer = b""
+        self.recording = False
+        self.stamp: str | None = None
+        self._connect_or_launch()
+
+    def _connect_or_launch(self) -> None:
+        try:
+            self._connect()
+        except OSError as error:
+            raise SystemExit("ยังเชื่อมต่อ OBS ไม่ได้ — กรุณาเปิด OBS ด้วยมือก่อนรัน detector.py") from error
+
+    def _connect(self) -> None:
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(request.encode())
+        response = b""
+        while b"\r\n\r\n" not in response:
+            response += sock.recv(4096)
+        headers, self.recv_buffer = response.split(b"\r\n\r\n", 1)
+        if b" 101 " not in headers.split(b"\r\n", 1)[0]:
+            sock.close()
+            raise OSError("OBS WebSocket handshake failed")
+        self.socket = sock
+        hello = self._receive_json()
+        auth_data = hello.get("d", {}).get("authentication")
+        identify = {"rpcVersion": 1}
+        if auth_data:
+            secret = base64.b64encode(
+                hashlib.sha256((self.password + auth_data["salt"]).encode()).digest()
+            ).decode()
+            identify["authentication"] = base64.b64encode(
+                hashlib.sha256((secret + auth_data["challenge"]).encode()).digest()
+            ).decode()
+        self._send_json({"op": 1, "d": identify})
+        identified = self._receive_json()
+        if identified.get("op") != 2:
+            sock.close()
+            self.socket = None
+            raise SystemExit("OBS WebSocket authentication ไม่สำเร็จ")
+
+    def _send_json(self, value: dict) -> None:
+        if self.socket is None:
+            raise RuntimeError("OBS WebSocket disconnected")
+        payload = json.dumps(value).encode()
+        mask = os.urandom(4)
+        length = len(payload)
+        header = bytearray([0x81])
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.extend([0xFE]); header.extend(struct.pack("!H", length))
+        else:
+            header.extend([0xFF]); header.extend(struct.pack("!Q", length))
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.socket.sendall(bytes(header) + mask + masked)
+
+    def _receive_json(self) -> dict:
+        if self.socket is None:
+            raise RuntimeError("OBS WebSocket disconnected")
+        first = self._recv_exact(2)
+        length = first[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(8))[0]
+        if first[1] & 0x80:
+            mask = self._recv_exact(4)
+            payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(self._recv_exact(length)))
+        else:
+            payload = self._recv_exact(length)
+        return json.loads(payload.decode())
+
+    def _recv_exact(self, length: int) -> bytes:
+        data = self.recv_buffer[:length]
+        self.recv_buffer = self.recv_buffer[length:]
+        while len(data) < length:
+            part = self.socket.recv(length - len(data))
+            if not part:
+                raise RuntimeError("OBS WebSocket disconnected")
+            data += part
+        return data
+
+    def _request(self, request_type: str) -> dict:
+        request_id = str(uuid.uuid4())
+        self._send_json({"op": 6, "d": {"requestType": request_type, "requestId": request_id}})
+        while True:
+            response = self._receive_json()
+            data = response.get("d", {})
+            if response.get("op") == 7 and data.get("requestId") == request_id:
+                status = data.get("requestStatus", {})
+                if not status.get("result"):
+                    raise RuntimeError(f"OBS {request_type} ไม่สำเร็จ: {status.get('comment', status.get('code'))}")
+                return data.get("responseData", {})
+
+    def record(self, _frame: np.ndarray, paused: bool) -> None:
+        if not paused:
+            self.start()
+
+    def start(self) -> None:
+        if not self.recording:
+            self._request("StartRecord")
+            self.recording = True
+            self.stamp = time.strftime("%Y-%m-%d_%H-%M-%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+            print(f"เริ่มอัดคลิปด้วย OBS: {self.stamp}")
+
+    def finish(self, reason: str) -> None:
+        if not self.recording or self.stamp is None:
+            return
+        response = self._request("StopRecord")
+        self.recording = False
+        source = Path(response.get("outputPath", ""))
+        if not source.exists():
+            raise RuntimeError(f"OBS หยุดอัดแล้วแต่ไม่พบไฟล์: {source}")
+        self.stamp = None
+        video_extensions = {".mkv", ".mp4", ".mov", ".flv", ".avi", ".webm", ".ts"}
+        clips = sorted(
+            (
+                path for path in source.parent.iterdir()
+                if path.is_file() and path.suffix.lower() in video_extensions
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for old_path in clips[MAX_PAUSE_CLIPS:]:
+            old_path.unlink(missing_ok=True)
+        print(f"OBS หยุดอัด ({reason}): {source} — เก็บ 3 คลิปล่าสุดในโฟลเดอร์นี้")
+
+
+def pause_macro(macro: AdbMacroRunner, recorder: ObsClipRecorder, reason: str) -> None:
+    if not macro.paused.is_set():
+        # Freeze the macro first. Finalizing and pulling an MP4 can take a
+        # moment, and no macro action should slip through during that work.
+        macro.observe_scene(True)
+        # Keep the frozen scene briefly so the detected card/button is
+        # visible at the end of LDPlayer's native recording.
+        time.sleep(POST_PAUSE_RECORD_SECONDS)
+        recorder.finish(reason)
+    else:
+        macro.observe_scene(True)
+
+
+def resume_macro_with_recording(macro: AdbMacroRunner, recorder: ObsClipRecorder) -> None:
+    """Start the recorder before releasing a paused macro timeline."""
+    if not macro.paused.is_set():
+        return
+    if macro.absent_since is None:
+        macro.absent_since = time.monotonic()
+    elif time.monotonic() - macro.absent_since >= 0.5:
+        recorder.start()
+        macro.absent_since = None
+        macro.set_paused(False)
+
+
 def make_backend(name: str, monitor_index: int, adb_device: str | None):
     if name == "adb":
         return AdbBackend(adb_device)
@@ -342,6 +647,26 @@ def save_cancel_template(source: str) -> None:
     print(f"บันทึกภาพต้นแบบ Cancel แล้ว: {CANCEL_TEMPLATE}")
 
 
+def save_close_template(source: str) -> None:
+    image = cv2.imread(source)
+    if image is None:
+        raise SystemExit(f"อ่านภาพปุ่มไม่ได้: {source}")
+    if image.shape[0] < 30 or image.shape[1] < 30:
+        raise SystemExit("ภาพปุ่ม X มีขนาดเล็กเกินไป")
+    if not cv2.imwrite(str(CLOSE_TEMPLATE), image):
+        raise SystemExit("บันทึกภาพต้นแบบปุ่ม X ไม่สำเร็จ")
+    print(f"บันทึกภาพต้นแบบปุ่ม X แล้ว: {CLOSE_TEMPLATE}")
+
+
+def save_upgrade_window_template(source: str) -> None:
+    image = cv2.imread(source)
+    if image is None:
+        raise SystemExit(f"อ่านภาพหน้าต่าง Buy Upgrades ไม่ได้: {source}")
+    if not cv2.imwrite(str(UPGRADE_WINDOW_TEMPLATE), image):
+        raise SystemExit("บันทึกภาพต้นแบบ Buy Upgrades ไม่สำเร็จ")
+    print(f"บันทึกภาพต้นแบบ Buy Upgrades แล้ว: {UPGRADE_WINDOW_TEMPLATE}")
+
+
 def card_boxes(frame: np.ndarray, grid: list[float]) -> list[tuple[int, int, int, int]]:
     screen_h, screen_w = frame.shape[:2]
     x, y, w, h = grid
@@ -366,7 +691,9 @@ def active_card_indices(frame: np.ndarray, boxes: list[tuple[int, int, int, int]
         crop = frame[y1:y2, x1:x2]
         blue, green, red = cv2.split(crop)
         cream = (red > 225) & (green > 215) & ((red.astype(np.int16) - blue) > 14)
-        if float(cream.mean()) > 0.48:
+        # A real card interior is overwhelmingly pale cream. The old 0.48
+        # threshold mistook bright desert/gameplay backgrounds for 5 cards.
+        if float(cream.mean()) > 0.60:
             active.append(i)
     return active
 
@@ -429,8 +756,79 @@ def find_cancel_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, 
     return find_button(frame, grid, CANCEL_TEMPLATE)
 
 
+def find_close_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
+    """Find the grey circular X icon using its complete edge structure."""
+    if not CLOSE_TEMPLATE.exists():
+        return None
+    screen_h, screen_w = frame.shape[:2]
+    gx, gy, gw, gh = grid
+    gx, gy, gw, gh = gx * screen_w, gy * screen_h, gw * screen_w, gh * screen_h
+    x1 = max(0, int(gx - gw * 0.55))
+    y1 = max(0, int(gy - gh * 0.45))
+    x2 = min(screen_w, int(gx + gw * 1.55))
+    y2 = min(screen_h, int(gy + gh * 1.30))
+    search = frame[y1:y2, x1:x2]
+    template = cv2.imread(str(CLOSE_TEMPLATE))
+    if template is None:
+        return None
+    search_edge = cv2.Canny(cv2.cvtColor(search, cv2.COLOR_BGR2GRAY), 60, 150)
+    best_score, best_box = 0.0, None
+    for scale in np.linspace(0.60, 1.50, 19):
+        width, height = int(template.shape[1] * scale), int(template.shape[0] * scale)
+        if width < 35 or height < 35 or width > search.shape[1] or height > search.shape[0]:
+            continue
+        resized = cv2.resize(template, (width, height), interpolation=cv2.INTER_AREA)
+        edge = cv2.Canny(cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY), 60, 150)
+        result = cv2.matchTemplate(search_edge, edge, cv2.TM_CCOEFF_NORMED)
+        _, score, _, location = cv2.minMaxLoc(result)
+        if score > best_score:
+            best_score = float(score)
+            bx, by = location
+            best_box = (x1 + bx, y1 + by, x1 + bx + width, y1 + by + height)
+    # The Windows screenshot template is about 10% larger than the native
+    # 1600x900 ADB render. Rescaling softens its edges, so X matching needs a
+    # lower threshold than text buttons; a normal no-popup scene peaks ~0.35.
+    return best_box if best_score >= 0.55 else None
+
+
+def is_upgrade_window(frame: np.ndarray) -> bool:
+    """Recognize the Buy Upgrades header whose X button must be ignored."""
+    template = cv2.imread(str(UPGRADE_WINDOW_TEMPLATE)) if UPGRADE_WINDOW_TEMPLATE.exists() else None
+    if template is None:
+        return False
+    height, width = template.shape[:2]
+    # Match only the distinctive title; item icons and levels can change.
+    title = template[int(height * 0.05):int(height * 0.30), int(width * 0.04):int(width * 0.47)]
+    frame_edge = cv2.Canny(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 60, 150)
+    title_edge = cv2.Canny(cv2.cvtColor(title, cv2.COLOR_BGR2GRAY), 60, 150)
+    best_score = 0.0
+    for scale in np.linspace(0.60, 1.50, 19):
+        tw, th = int(title.shape[1] * scale), int(title.shape[0] * scale)
+        if tw < 100 or th < 25 or tw > frame.shape[1] or th > frame.shape[0]:
+            continue
+        resized = cv2.resize(title_edge, (tw, th), interpolation=cv2.INTER_AREA)
+        result = cv2.matchTemplate(frame_edge, resized, cv2.TM_CCOEFF_NORMED)
+        _, score, _, _ = cv2.minMaxLoc(result)
+        best_score = max(best_score, float(score))
+    return best_score >= 0.78
+
+
 def find_confirm_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
-    return find_button(frame, grid, CONFIRM_TEMPLATE)
+    box = find_button(frame, grid, CONFIRM_TEMPLATE)
+    if box is None:
+        return None
+    x1, y1, x2, y2 = box
+    button = frame[y1:y2, x1:x2]
+    if button.size == 0:
+        return None
+    hsv = cv2.cvtColor(button, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    green = (
+        (hue >= 35) & (hue <= 85) &
+        (saturation > 80) & (value > 70)
+    )
+    # Confirm-like words on cyan/blue buttons must not pause or be tapped.
+    return box if float(green.mean()) >= 0.20 else None
 
 
 def feature(crop: np.ndarray) -> np.ndarray:
@@ -582,6 +980,7 @@ def run(
     last_click, previous_count, ready_at = 0.0, 0, 0.0
     learning = LearningStore(learning_enabled)
     macro = None
+    clip_recorder = None
     if macro_file:
         if not isinstance(backend, AdbBackend):
             raise SystemExit("--macro-file ใช้ได้เฉพาะ backend adb")
@@ -591,9 +990,13 @@ def run(
         if not macro_path.exists():
             raise SystemExit(f"ไม่พบ macro file: {macro_path}")
         macro = AdbMacroRunner(macro_path, backend, loop=not macro_once)
+        # OBS clip recording is temporarily disabled.
+        # clip_recorder = ObsClipRecorder(backend.serial)
+        # clip_recorder.start()
         macro.start()
     pending = None
     candidate_slot, stable_frames = None, 0
+    close_latched = False
     cancel_latched = False
     if backend_name == "screen":
         pyautogui.FAILSAFE = True
@@ -604,8 +1007,31 @@ def run(
         if macro and macro.error:
             raise SystemExit(f"ADB macro หยุดเพราะข้อผิดพลาด: {macro.error}")
         frame = backend.grab()
+        if macro and clip_recorder:
+            clip_recorder.record(frame, macro.paused.is_set())
+        close = None if is_upgrade_window(frame) else find_close_button(frame, grid)
+        if close:
+            finish_recording = bool(macro and clip_recorder and not macro.paused.is_set())
+            if macro:
+                macro.observe_scene(True)
+            candidate_slot, stable_frames = None, 0
+            if not close_latched:
+                x1, y1, x2, y2 = close
+                if click:
+                    backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
+                    print("คลิกปุ่ม X")
+                last_click = time.time()
+                close_latched = True
+            if finish_recording:
+                time.sleep(POST_PAUSE_RECORD_SECONDS)
+                clip_recorder.finish("close")
+            time.sleep(interval)
+            continue
+        close_latched = False
+
         cancel = find_cancel_button(frame, grid)
         if cancel:
+            finish_recording = bool(macro and clip_recorder and not macro.paused.is_set())
             if macro:
                 macro.observe_scene(True)
             candidate_slot, stable_frames = None, 0
@@ -616,12 +1042,16 @@ def run(
                     print("คลิกปุ่ม Cancel")
                 last_click = time.time()
                 cancel_latched = True
+            if finish_recording:
+                time.sleep(POST_PAUSE_RECORD_SECONDS)
+                clip_recorder.finish("cancel")
             time.sleep(interval)
             continue
         cancel_latched = False
 
         confirm = find_confirm_button(frame, grid)
         if confirm and time.time() - last_click > 0.30:
+            finish_recording = bool(macro and clip_recorder and not macro.paused.is_set())
             if macro:
                 macro.observe_scene(True)
             candidate_slot, stable_frames = None, 0
@@ -630,6 +1060,9 @@ def run(
                 backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
                 print("คลิกปุ่ม Confirm")
             last_click = time.time()
+            if finish_recording:
+                time.sleep(POST_PAUSE_RECORD_SECONDS)
+                clip_recorder.finish("confirm")
             time.sleep(interval)
             continue
 
@@ -637,7 +1070,14 @@ def run(
         active_indices = active_card_indices(frame, boxes)
         active_count = len(active_indices)
         if macro:
-            macro.observe_scene(active_count in (5, 6))
+            if active_count in (5, 6) and clip_recorder:
+                pause_macro(macro, clip_recorder, f"cards_{active_count}")
+            elif active_count in (5, 6):
+                macro.observe_scene(True)
+            elif clip_recorder:
+                resume_macro_with_recording(macro, clip_recorder)
+            else:
+                macro.observe_scene(False)
 
         if pending is not None:
             clicked_slot = pending["slot"]
@@ -712,6 +1152,8 @@ def run(
     cv2.destroyAllWindows()
     if macro:
         macro.stop()
+    if clip_recorder:
+        clip_recorder.finish("stopped")
 
 
 def main() -> None:
@@ -726,6 +1168,8 @@ def main() -> None:
     parser.add_argument("--macro-once", action="store_true", help="เล่น macro รอบเดียวแทนการวนซ้ำ")
     parser.add_argument("--confirm-template", metavar="IMAGE", help="บันทึกภาพปุ่ม Confirm เป็นต้นแบบ")
     parser.add_argument("--cancel-template", metavar="IMAGE", help="บันทึกภาพปุ่ม Cancel เป็นต้นแบบ")
+    parser.add_argument("--close-template", metavar="IMAGE", help="บันทึกภาพปุ่ม X เป็นต้นแบบ")
+    parser.add_argument("--upgrade-window-template", metavar="IMAGE", help="บันทึกหน้าต่าง Buy Upgrades ที่ต้องยกเว้นปุ่ม X")
     parser.add_argument("--dry-run", action="store_true", help="แสดงผลอย่างเดียว ไม่คลิกจริง")
     parser.add_argument("--no-preview", action="store_true", help="ไม่แสดงหน้าต่างตรวจสอบ")
     parser.add_argument("--interval", type=float, default=0.08, help="เวลาระหว่างเฟรม (วินาที)")
@@ -749,6 +1193,10 @@ def main() -> None:
         save_confirm_template(args.confirm_template)
     elif args.cancel_template:
         save_cancel_template(args.cancel_template)
+    elif args.close_template:
+        save_close_template(args.close_template)
+    elif args.upgrade_window_template:
+        save_upgrade_window_template(args.upgrade_window_template)
     elif args.calibrate:
         calibrate(args.backend or "screen", args.monitor or 1, args.adb_device)
     else:

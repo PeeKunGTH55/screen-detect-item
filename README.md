@@ -95,8 +95,33 @@ python detector.py --confirm-template "C:\path\to\confirm.png"
 python detector.py --cancel-template "C:\path\to\cancel.png"
 ```
 
+ตั้งภาพต้นแบบปุ่มปิด `X`:
+
+```powershell
+python detector.py --close-template "C:\path\to\close.png"
+```
+
+ลำดับตรวจปุ่มคือ X, Cancel, Confirm และแต่ละปุ่มจะถูกกดเพียงครั้งเดียวต่อการปรากฏ
+
+ปุ่ม X จะถูกยกเว้นเมื่อพบหัวข้อ `Buy Upgrades!` หากหน้าตาเมนูเปลี่ยน สามารถเปลี่ยน
+ภาพต้นแบบของหน้าต่างยกเว้นได้ด้วย:
+
+```powershell
+python detector.py --upgrade-window-template "C:\path\to\buy-upgrades.png"
+```
+
 ตัวตรวจจะเทียบข้อความสีขาวกลางปุ่มแทนสีหรือทรงปุ่ม ตรวจ Cancel ก่อน Confirm
 ทุกเฟรม และกด Cancel เพียงครั้งเดียวจนกว่าปุ่มจะหาย หากใช้ ADB การกดจะไม่ขยับเมาส์จริง
+
+เมื่อเล่น ADB macro โปรแกรมจะสั่ง OBS ผ่าน WebSocket ให้อัดตั้งแต่เริ่มหรือ resume จนถึง
+pause โดยให้ OBS ตั้งชื่อและเก็บไฟล์ใน Recording Path ตามปกติ หลังหยุดอัดโปรแกรมจะตรวจ
+โฟลเดอร์นั้น เก็บวิดีโอใหม่สุด 3 คลิป และลบวิดีโอเก่ากว่านั้นแบบวนอัตโนมัติ
+
+> หมายเหตุ: การอัดคลิป OBS ถูก comment ปิดไว้ชั่วคราวใน `run()` ระบบจะไม่เชื่อมต่อ
+> เริ่ม/หยุดอัด หรือลบคลิป แต่ ADB macro และการ pause/resume ยังทำงานตามปกติ
+ก่อนใช้งานให้เปิด OBS ด้วยมือ เปิด WebSocket Server และตั้ง Scene เป็น Game Capture หรือ
+Window Capture ของ `dnplayer.exe` เมื่อพบเหตุ pause โปรแกรมจะหยุด macro ก่อน รอ 0.3 วินาที
+แล้วสั่ง OBS หยุดอัดผ่าน API โดยไม่ส่งคีย์และไม่ดึงโฟกัส
 
 เมื่อปุ่มที่ตรงกับภาพต้นแบบปรากฏใกล้บริเวณมินิเกม โปรแกรมจะคลิกทันทีตั้งแต่เฟรมแรก โปรแกรมจะไม่กดปุ่มสีเขียวอื่นที่ไม่ตรงกับคำว่า `Confirm`
 
