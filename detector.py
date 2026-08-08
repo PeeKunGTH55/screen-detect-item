@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import uuid
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -29,6 +30,7 @@ CONFIRM_TEMPLATE = Path(__file__).with_name("confirm_template.png")
 CANCEL_TEMPLATE = Path(__file__).with_name("cancel_template.png")
 CLOSE_TEMPLATE = Path(__file__).with_name("close_template.png")
 UPGRADE_WINDOW_TEMPLATE = Path(__file__).with_name("upgrade_window_template.png")
+ACTION_TEMPLATE = Path(__file__).with_name("action_template.png")
 TRAINING_DIR = Path(__file__).with_name("training_data")
 TRAINING_FILE = TRAINING_DIR / "samples.npz"
 PAUSE_CLIPS_DIR = Path(__file__).with_name("pause_clips")
@@ -38,7 +40,13 @@ OBS_PATH = Path(r"C:\Program Files\obs-studio\bin\64bit\obs64.exe")
 OBS_WEBSOCKET_CONFIG = Path.home() / r"AppData\Roaming\obs-studio\plugin_config\obs-websocket\config.json"
 MAX_SAMPLES_PER_CLASS = 250
 ODD_DUPLICATE_DISTANCE = 0.10
-REQUIRED_STABLE_FRAMES = 3
+REQUIRED_STABLE_FRAMES = 1
+CLOSE_RETRY_SECONDS = 0.70
+CLOSE_MAX_ATTEMPTS = 5
+ACTION_BURST_CLICKS = 10
+ACTION_THRESHOLD = 0.45
+TEMPLATE_DETECTION_SCALE = 0.50
+TEMPLATE_SCALES = tuple(round(0.60 + index * 0.05, 2) for index in range(19))
 DEFAULT_ADB_PATH = Path(r"C:\LDPlayer\LDPlayer14\adb.exe")
 ADB_TIMEOUT = 5.0
 OPERATION_RECORDS_DIR = Path(r"C:\LDPlayer\LDPlayer14\vms\operationRecords")
@@ -144,6 +152,9 @@ class ScreenBackend:
     def tap(self, x: int, y: int) -> None:
         pyautogui.click(self.left + x, self.top + y, duration=0.06)
 
+    def tap_burst(self, x: int, y: int, count: int) -> None:
+        pyautogui.click(self.left + x, self.top + y, clicks=count, interval=0.0)
+
 
 class AdbBackend:
     name = "adb"
@@ -168,6 +179,14 @@ class AdbBackend:
             run_adb(["shell", "input", "tap", str(x), str(y)], self.serial)
         except RuntimeError as error:
             raise SystemExit(f"ส่ง ADB tap ไม่สำเร็จ: {error}") from error
+
+    def tap_burst(self, x: int, y: int, count: int) -> None:
+        """Send the whole burst through one ADB process to minimize latency."""
+        command = "; ".join(f"input tap {x} {y}" for _ in range(count))
+        try:
+            run_adb(["shell", "sh", "-c", command], self.serial)
+        except RuntimeError as error:
+            raise SystemExit(f"ส่ง ADB tap แบบรัวไม่สำเร็จ: {error}") from error
 
     def gesture(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int) -> None:
         if abs(x2 - x1) < 3 and abs(y2 - y1) < 3 and duration_ms < 300:
@@ -667,6 +686,17 @@ def save_upgrade_window_template(source: str) -> None:
     print(f"บันทึกภาพต้นแบบ Buy Upgrades แล้ว: {UPGRADE_WINDOW_TEMPLATE}")
 
 
+def save_action_template(source: str) -> None:
+    image = cv2.imread(source)
+    if image is None:
+        raise SystemExit(f"อ่านภาพปุ่ม action ไม่ได้: {source}")
+    if image.shape[0] < 30 or image.shape[1] < 30:
+        raise SystemExit("ภาพปุ่ม action มีขนาดเล็กเกินไป")
+    if not cv2.imwrite(str(ACTION_TEMPLATE), image):
+        raise SystemExit("บันทึกภาพต้นแบบปุ่ม action ไม่สำเร็จ")
+    print(f"บันทึกภาพต้นแบบปุ่ม action แล้ว: {ACTION_TEMPLATE}")
+
+
 def card_boxes(frame: np.ndarray, grid: list[float]) -> list[tuple[int, int, int, int]]:
     screen_h, screen_w = frame.shape[:2]
     x, y, w, h = grid
@@ -698,53 +728,111 @@ def active_card_indices(frame: np.ndarray, boxes: list[tuple[int, int, int, int]
     return active
 
 
-def find_button(
-    frame: np.ndarray, grid: list[float], template_path: Path, threshold: float = 0.82
-) -> tuple[int, int, int, int] | None:
-    """Find a button by its white centre text, not its colour or outer shape."""
-    if not template_path.exists():
-        return None
-    screen_h, screen_w = frame.shape[:2]
-    gx, gy, gw, gh = grid
-    gx, gy, gw, gh = gx * screen_w, gy * screen_h, gw * screen_w, gh * screen_h
-    x1 = max(0, int(gx - gw * 0.45))
-    y1 = max(0, int(gy - gh * 0.35))
-    x2 = min(screen_w, int(gx + gw * 1.45))
-    y2 = min(screen_h, int(gy + gh * 1.25))
-    search = frame[y1:y2, x1:x2]
-    template = cv2.imread(str(template_path))
+def white_text_mask(image: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    return (((hsv[:, :, 1] < 70) & (hsv[:, :, 2] > 185)) * 255).astype(np.uint8)
+
+
+@lru_cache(maxsize=8)
+def cached_text_template(path_string: str):
+    template = cv2.imread(path_string)
     if template is None:
         return None
     template_h, template_w = template.shape[:2]
-    crop_left, crop_right = int(template_w * 0.16), int(template_w * 0.84)
-    crop_top, crop_bottom = int(template_h * 0.22), int(template_h * 0.88)
-    text_template = template[crop_top:crop_bottom, crop_left:crop_right]
+    left, right = int(template_w * 0.16), int(template_w * 0.84)
+    top, bottom = int(template_h * 0.22), int(template_h * 0.88)
+    mask = white_text_mask(template[top:bottom, left:right])
+    variants = []
+    for scale in TEMPLATE_SCALES:
+        width = max(1, int(mask.shape[1] * scale * TEMPLATE_DETECTION_SCALE))
+        height = max(1, int(mask.shape[0] * scale * TEMPLATE_DETECTION_SCALE))
+        variants.append((scale, cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)))
+    return template_h, template_w, left, top, variants
 
-    def white_text_mask(image: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        return (((hsv[:, :, 1] < 70) & (hsv[:, :, 2] > 185)) * 255).astype(np.uint8)
 
-    search_mask = white_text_mask(search)
-    template_mask = white_text_mask(text_template)
-    if cv2.countNonZero(template_mask) < 20:
+@lru_cache(maxsize=8)
+def cached_edge_template(path_string: str, kind: str):
+    template = cv2.imread(path_string)
+    if template is None:
         return None
+    if kind == "upgrade":
+        height, width = template.shape[:2]
+        template = template[int(height * 0.05):int(height * 0.30), int(width * 0.04):int(width * 0.47)]
+    edge = cv2.Canny(cv2.cvtColor(template, cv2.COLOR_BGR2GRAY), 60, 150)
+    variants = []
+    for scale in TEMPLATE_SCALES:
+        width = max(1, int(edge.shape[1] * scale * TEMPLATE_DETECTION_SCALE))
+        height = max(1, int(edge.shape[0] * scale * TEMPLATE_DETECTION_SCALE))
+        variants.append((scale, cv2.resize(edge, (width, height), interpolation=cv2.INTER_AREA)))
+    return template.shape[:2], variants
+
+
+@lru_cache(maxsize=2)
+def cached_close_template(path_string: str):
+    template = cv2.imread(path_string)
+    if template is None:
+        return None
+    hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+    mask = (((hsv[:, :, 1] < 60) & (hsv[:, :, 2] > 200)) * 255).astype(np.uint8)
+    variants = []
+    for scale in TEMPLATE_SCALES:
+        width = max(1, int(mask.shape[1] * scale * TEMPLATE_DETECTION_SCALE))
+        height = max(1, int(mask.shape[0] * scale * TEMPLATE_DETECTION_SCALE))
+        variants.append((scale, cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)))
+    return template.shape[:2], variants
+
+
+@lru_cache(maxsize=2)
+def cached_action_template(path_string: str):
+    template = cv2.imread(path_string)
+    if template is None:
+        return None
+    variants = []
+    for scale in TEMPLATE_SCALES:
+        width = max(1, int(template.shape[1] * scale * TEMPLATE_DETECTION_SCALE))
+        height = max(1, int(template.shape[0] * scale * TEMPLATE_DETECTION_SCALE))
+        resized = cv2.resize(template, (width, height), interpolation=cv2.INTER_AREA)
+        edge = cv2.Canny(cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY), 60, 150)
+        variants.append((scale, edge))
+    return template.shape[:2], variants
+
+
+def find_button(
+    frame: np.ndarray, grid: list[float], template_path: Path, threshold: float = 0.82
+) -> tuple[int, int, int, int] | None:
+    """Find button text in a half-size popup ROI using cached templates."""
+    data = cached_text_template(str(template_path)) if template_path.exists() else None
+    if data is None:
+        return None
+    template_h, template_w, crop_left, crop_top, variants = data
+    screen_h, screen_w = frame.shape[:2]
+    gx, gy, gw, gh = grid
+    gx, gy, gw, gh = gx * screen_w, gy * screen_h, gw * screen_w, gh * screen_h
+    x1 = max(0, int(gx - gw * 0.25))
+    y1 = max(0, int(gy - gh * 0.25))
+    x2 = min(screen_w, int(gx + gw * 1.25))
+    y2 = min(screen_h, int(gy + gh * 1.15))
+    search = frame[y1:y2, x1:x2]
+    search_mask = cv2.resize(
+        white_text_mask(search), None,
+        fx=TEMPLATE_DETECTION_SCALE, fy=TEMPLATE_DETECTION_SCALE,
+        interpolation=cv2.INTER_NEAREST,
+    )
     best_score, best_box = 0.0, None
-    # Allow emulator resolution scaling while requiring the exact word pattern.
-    for scale in np.linspace(0.60, 1.45, 18):
-        text_w = int(text_template.shape[1] * scale)
-        text_h = int(text_template.shape[0] * scale)
-        if text_w < 40 or text_h < 20 or text_w > search.shape[1] or text_h > search.shape[0]:
+    for scale, resized in variants:
+        height, width = resized.shape[:2]
+        if width > search_mask.shape[1] or height > search_mask.shape[0]:
             continue
-        resized = cv2.resize(template_mask, (text_w, text_h), interpolation=cv2.INTER_NEAREST)
-        result = cv2.matchTemplate(search_mask, resized, cv2.TM_CCOEFF_NORMED)
-        _, score, _, location = cv2.minMaxLoc(result)
+        _, score, _, location = cv2.minMaxLoc(
+            cv2.matchTemplate(search_mask, resized, cv2.TM_CCOEFF_NORMED)
+        )
         if score > best_score:
             best_score = float(score)
-            text_x, text_y = location
-            button_x = x1 + text_x - int(crop_left * scale)
-            button_y = y1 + text_y - int(crop_top * scale)
-            button_w = int(template_w * scale)
-            button_h = int(template_h * scale)
+            text_x = location[0] / TEMPLATE_DETECTION_SCALE
+            text_y = location[1] / TEMPLATE_DETECTION_SCALE
+            button_x = int(x1 + text_x - crop_left * scale)
+            button_y = int(y1 + text_y - crop_top * scale)
+            button_w, button_h = int(template_w * scale), int(template_h * scale)
             best_box = (
                 max(0, button_x), max(0, button_y),
                 min(screen_w, button_x + button_w), min(screen_h, button_y + button_h),
@@ -753,68 +841,103 @@ def find_button(
 
 
 def find_cancel_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
-    return find_button(frame, grid, CANCEL_TEMPLATE)
+    return find_button(frame, grid, CANCEL_TEMPLATE, threshold=0.75)
 
 
 def find_close_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
-    """Find the grey circular X icon using its complete edge structure."""
-    if not CLOSE_TEMPLATE.exists():
+    """Find the white X mark in the top screen band."""
+    data = cached_close_template(str(CLOSE_TEMPLATE)) if CLOSE_TEMPLATE.exists() else None
+    if data is None:
         return None
     screen_h, screen_w = frame.shape[:2]
-    gx, gy, gw, gh = grid
-    gx, gy, gw, gh = gx * screen_w, gy * screen_h, gw * screen_w, gh * screen_h
-    x1 = max(0, int(gx - gw * 0.55))
-    y1 = max(0, int(gy - gh * 0.45))
-    x2 = min(screen_w, int(gx + gw * 1.55))
-    y2 = min(screen_h, int(gy + gh * 1.30))
-    search = frame[y1:y2, x1:x2]
-    template = cv2.imread(str(CLOSE_TEMPLATE))
-    if template is None:
-        return None
-    search_edge = cv2.Canny(cv2.cvtColor(search, cv2.COLOR_BGR2GRAY), 60, 150)
+    (template_h, template_w), variants = data
+    x1, y1, x2, y2 = 0, 0, screen_w, min(screen_h, int(screen_h * 0.35))
+    search_hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+    search_mask = (((search_hsv[:, :, 1] < 60) & (search_hsv[:, :, 2] > 200)) * 255).astype(np.uint8)
+    search_mask = cv2.resize(
+        search_mask, None,
+        fx=TEMPLATE_DETECTION_SCALE, fy=TEMPLATE_DETECTION_SCALE,
+        interpolation=cv2.INTER_NEAREST,
+    )
     best_score, best_box = 0.0, None
-    for scale in np.linspace(0.60, 1.50, 19):
-        width, height = int(template.shape[1] * scale), int(template.shape[0] * scale)
-        if width < 35 or height < 35 or width > search.shape[1] or height > search.shape[0]:
+    for scale, mask in variants:
+        height, width = mask.shape[:2]
+        if width > search_mask.shape[1] or height > search_mask.shape[0]:
             continue
-        resized = cv2.resize(template, (width, height), interpolation=cv2.INTER_AREA)
-        edge = cv2.Canny(cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY), 60, 150)
-        result = cv2.matchTemplate(search_edge, edge, cv2.TM_CCOEFF_NORMED)
+        result = cv2.matchTemplate(search_mask, mask, cv2.TM_CCOEFF_NORMED)
         _, score, _, location = cv2.minMaxLoc(result)
         if score > best_score:
             best_score = float(score)
-            bx, by = location
-            best_box = (x1 + bx, y1 + by, x1 + bx + width, y1 + by + height)
-    # The Windows screenshot template is about 10% larger than the native
-    # 1600x900 ADB render. Rescaling softens its edges, so X matching needs a
-    # lower threshold than text buttons; a normal no-popup scene peaks ~0.35.
-    return best_box if best_score >= 0.55 else None
+            bx = int(location[0] / TEMPLATE_DETECTION_SCALE)
+            by = int(location[1] / TEMPLATE_DETECTION_SCALE)
+            full_w, full_h = int(template_w * scale), int(template_h * scale)
+            best_box = (x1 + bx, y1 + by, x1 + bx + full_w, y1 + by + full_h)
+    return best_box if best_score >= 0.78 else None
 
 
 def is_upgrade_window(frame: np.ndarray) -> bool:
     """Recognize the Buy Upgrades header whose X button must be ignored."""
-    template = cv2.imread(str(UPGRADE_WINDOW_TEMPLATE)) if UPGRADE_WINDOW_TEMPLATE.exists() else None
-    if template is None:
+    data = cached_edge_template(str(UPGRADE_WINDOW_TEMPLATE), "upgrade") if UPGRADE_WINDOW_TEMPLATE.exists() else None
+    if data is None:
         return False
-    height, width = template.shape[:2]
-    # Match only the distinctive title; item icons and levels can change.
-    title = template[int(height * 0.05):int(height * 0.30), int(width * 0.04):int(width * 0.47)]
-    frame_edge = cv2.Canny(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 60, 150)
-    title_edge = cv2.Canny(cv2.cvtColor(title, cv2.COLOR_BGR2GRAY), 60, 150)
+    _, variants = data
+    top = frame[:max(1, int(frame.shape[0] * 0.30)), :]
+    top = cv2.resize(
+        top, None, fx=TEMPLATE_DETECTION_SCALE, fy=TEMPLATE_DETECTION_SCALE,
+        interpolation=cv2.INTER_AREA,
+    )
+    frame_edge = cv2.Canny(cv2.cvtColor(top, cv2.COLOR_BGR2GRAY), 60, 150)
     best_score = 0.0
-    for scale in np.linspace(0.60, 1.50, 19):
-        tw, th = int(title.shape[1] * scale), int(title.shape[0] * scale)
-        if tw < 100 or th < 25 or tw > frame.shape[1] or th > frame.shape[0]:
+    for _scale, resized in variants:
+        th, tw = resized.shape[:2]
+        if tw > frame_edge.shape[1] or th > frame_edge.shape[0]:
             continue
-        resized = cv2.resize(title_edge, (tw, th), interpolation=cv2.INTER_AREA)
         result = cv2.matchTemplate(frame_edge, resized, cv2.TM_CCOEFF_NORMED)
         _, score, _, _ = cv2.minMaxLoc(result)
         best_score = max(best_score, float(score))
-    return best_score >= 0.78
+    return best_score >= 0.68
+
+
+def find_action_button(
+    frame: np.ndarray,
+) -> tuple[tuple[int, int, int, int], float] | None:
+    """Find the action icon in the central gameplay area and return its score."""
+    data = cached_action_template(str(ACTION_TEMPLATE)) if ACTION_TEMPLATE.exists() else None
+    if data is None:
+        return None
+    (template_h, template_w), variants = data
+    screen_h, screen_w = frame.shape[:2]
+    # The action prompt appears in the gameplay area. Cropping avoids UI icons
+    # around the edges and makes matching substantially faster.
+    roi_x1, roi_y1 = int(screen_w * 0.20), int(screen_h * 0.18)
+    roi_x2, roi_y2 = int(screen_w * 0.80), int(screen_h * 0.82)
+    search = cv2.resize(
+        frame[roi_y1:roi_y2, roi_x1:roi_x2],
+        None,
+        fx=TEMPLATE_DETECTION_SCALE,
+        fy=TEMPLATE_DETECTION_SCALE,
+        interpolation=cv2.INTER_AREA,
+    )
+    search_edge = cv2.Canny(cv2.cvtColor(search, cv2.COLOR_BGR2GRAY), 60, 150)
+    best_score, best_box = 0.0, None
+    for scale, edge in variants:
+        height, width = edge.shape[:2]
+        if width > search_edge.shape[1] or height > search_edge.shape[0]:
+            continue
+        _, score, _, location = cv2.minMaxLoc(
+            cv2.matchTemplate(search_edge, edge, cv2.TM_CCOEFF_NORMED)
+        )
+        if score > best_score:
+            best_score = float(score)
+            x = roi_x1 + int(location[0] / TEMPLATE_DETECTION_SCALE)
+            y = roi_y1 + int(location[1] / TEMPLATE_DETECTION_SCALE)
+            width_full, height_full = int(template_w * scale), int(template_h * scale)
+            best_box = (x, y, x + width_full, y + height_full)
+    return (best_box, best_score) if best_box is not None and best_score >= ACTION_THRESHOLD else None
 
 
 def find_confirm_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
-    box = find_button(frame, grid, CONFIRM_TEMPLATE)
+    box = find_button(frame, grid, CONFIRM_TEMPLATE, threshold=0.75)
     if box is None:
         return None
     x1, y1, x2, y2 = box
@@ -960,6 +1083,7 @@ def run(
     adb_device_override: str | None,
     macro_file: str | None,
     macro_once: bool,
+    action_enabled: bool,
 ) -> None:
     if not CONFIG.exists():
         raise SystemExit("ยังไม่ได้ตั้งพื้นที่ กรุณารัน: python detector.py --calibrate")
@@ -997,6 +1121,8 @@ def run(
     pending = None
     candidate_slot, stable_frames = None, 0
     close_latched = False
+    close_last_tap, close_tap_attempts = 0.0, 0
+    action_latched = False
     cancel_latched = False
     if backend_name == "screen":
         pyautogui.FAILSAFE = True
@@ -1009,25 +1135,60 @@ def run(
         frame = backend.grab()
         if macro and clip_recorder:
             clip_recorder.record(frame, macro.paused.is_set())
-        close = None if is_upgrade_window(frame) else find_close_button(frame, grid)
+        upgrade_visible = is_upgrade_window(frame)
+        action = (
+            find_action_button(frame)
+            if action_enabled and not upgrade_visible
+            else None
+        )
+        if action:
+            candidate_slot, stable_frames = None, 0
+            if not action_latched:
+                action_latched = True
+                action_box, action_score = action
+                x1, y1, x2, y2 = action_box
+                if click:
+                    tap_x, tap_y = (x1 + x2) // 2, (y1 + y2) // 2
+                    backend.tap_burst(tap_x, tap_y, ACTION_BURST_CLICKS)
+                    last_click = time.time()
+                    print(
+                        f"พบปุ่ม action {action_score * 100:.1f}% — "
+                        f"คลิกรัว {ACTION_BURST_CLICKS} ครั้งที่ ({tap_x}, {tap_y})"
+                    )
+                else:
+                    print(f"พบปุ่ม action {action_score * 100:.1f}% (dry-run)")
+            time.sleep(interval)
+            continue
+        action_latched = False
+
+        close = None if upgrade_visible else find_close_button(frame, grid)
         if close:
             finish_recording = bool(macro and clip_recorder and not macro.paused.is_set())
             if macro:
                 macro.observe_scene(True)
             candidate_slot, stable_frames = None, 0
             if not close_latched:
-                x1, y1, x2, y2 = close
-                if click:
-                    backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
-                    print("คลิกปุ่ม X")
-                last_click = time.time()
                 close_latched = True
+                close_last_tap, close_tap_attempts = 0.0, 0
+            now = time.time()
+            if (
+                click
+                and close_tap_attempts < CLOSE_MAX_ATTEMPTS
+                and now - close_last_tap >= CLOSE_RETRY_SECONDS
+            ):
+                x1, y1, x2, y2 = close
+                backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
+                close_tap_attempts += 1
+                close_last_tap = now
+                last_click = now
+                print(f"คลิกปุ่ม X ครั้งที่ {close_tap_attempts}/{CLOSE_MAX_ATTEMPTS}")
             if finish_recording:
                 time.sleep(POST_PAUSE_RECORD_SECONDS)
                 clip_recorder.finish("close")
             time.sleep(interval)
             continue
         close_latched = False
+        close_last_tap, close_tap_attempts = 0.0, 0
 
         cancel = find_cancel_button(frame, grid)
         if cancel:
@@ -1097,9 +1258,12 @@ def run(
 
         valid_scene = active_count in (5, 6)
         if valid_scene and active_count != previous_count:
-            ready_at = time.time() + delay
+            ready_at = time.time() + delay if delay > 0 else 0.0
             candidate_slot, stable_frames = None, 0
-            print(f"พบการ์ด {active_count} ใบ — รอ {delay:.1f} วินาทีก่อนตรวจ")
+            if delay > 0:
+                print(f"พบการ์ด {active_count} ใบ — รอ {delay:.1f} วินาทีก่อนตรวจ")
+            else:
+                print(f"พบการ์ด {active_count} ใบ — เริ่มตรวจทันที")
         previous_count = active_count if valid_scene else 0
         if not valid_scene or time.time() < ready_at:
             if not valid_scene:
@@ -1170,10 +1334,16 @@ def main() -> None:
     parser.add_argument("--cancel-template", metavar="IMAGE", help="บันทึกภาพปุ่ม Cancel เป็นต้นแบบ")
     parser.add_argument("--close-template", metavar="IMAGE", help="บันทึกภาพปุ่ม X เป็นต้นแบบ")
     parser.add_argument("--upgrade-window-template", metavar="IMAGE", help="บันทึกหน้าต่าง Buy Upgrades ที่ต้องยกเว้นปุ่ม X")
+    parser.add_argument("--action-template", metavar="IMAGE", help="บันทึกภาพปุ่ม action ที่ต้องตรวจและกด")
+    parser.add_argument(
+        "--no-action",
+        action="store_true",
+        help="ปิดการตรวจและกดปุ่ม action ชั่วคราว",
+    )
     parser.add_argument("--dry-run", action="store_true", help="แสดงผลอย่างเดียว ไม่คลิกจริง")
     parser.add_argument("--no-preview", action="store_true", help="ไม่แสดงหน้าต่างตรวจสอบ")
     parser.add_argument("--interval", type=float, default=0.08, help="เวลาระหว่างเฟรม (วินาที)")
-    parser.add_argument("--delay", type=float, default=0.2, help="เวลารอหลังพบหรือจำนวนการ์ดเปลี่ยน (วินาที)")
+    parser.add_argument("--delay", type=float, default=0.0, help="เวลารอหลังพบหรือจำนวนการ์ดเปลี่ยน (ค่าเริ่มต้น 0)")
     learning_group = parser.add_mutually_exclusive_group()
     learning_group.add_argument("--learning", dest="learning", action="store_true", help="เปิดระบบเรียนรู้ (ค่าเริ่มต้น)")
     learning_group.add_argument("--no-learning", dest="learning", action="store_false", help="ปิดระบบเรียนรู้ชั่วคราว")
@@ -1197,6 +1367,8 @@ def main() -> None:
         save_close_template(args.close_template)
     elif args.upgrade_window_template:
         save_upgrade_window_template(args.upgrade_window_template)
+    elif args.action_template:
+        save_action_template(args.action_template)
     elif args.calibrate:
         calibrate(args.backend or "screen", args.monitor or 1, args.adb_device)
     else:
@@ -1211,6 +1383,7 @@ def main() -> None:
             args.adb_device,
             args.macro_file,
             args.macro_once,
+            not args.no_action,
         )
 
 
