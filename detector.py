@@ -31,6 +31,7 @@ CANCEL_TEMPLATE = Path(__file__).with_name("cancel_template.png")
 CLOSE_TEMPLATE = Path(__file__).with_name("close_template.png")
 UPGRADE_WINDOW_TEMPLATE = Path(__file__).with_name("upgrade_window_template.png")
 ACTION_TEMPLATE = Path(__file__).with_name("action_template.png")
+CLAIM_TEMPLATE = Path(__file__).with_name("claim_template.png")
 TRAINING_DIR = Path(__file__).with_name("training_data")
 TRAINING_FILE = TRAINING_DIR / "samples.npz"
 PAUSE_CLIPS_DIR = Path(__file__).with_name("pause_clips")
@@ -43,12 +44,15 @@ ODD_DUPLICATE_DISTANCE = 0.10
 REQUIRED_STABLE_FRAMES = 1
 CLOSE_RETRY_SECONDS = 0.70
 CLOSE_MAX_ATTEMPTS = 5
+CANCEL_RETRY_SECONDS = 0.65
+CANCEL_MAX_ATTEMPTS = 5
 ACTION_BURST_CLICKS = 10
 ACTION_THRESHOLD = 0.45
 TEMPLATE_DETECTION_SCALE = 0.50
 TEMPLATE_SCALES = tuple(round(0.60 + index * 0.05, 2) for index in range(19))
 DEFAULT_ADB_PATH = Path(r"C:\LDPlayer\LDPlayer14\adb.exe")
 ADB_TIMEOUT = 5.0
+ADB_RETRIES = 3
 OPERATION_RECORDS_DIR = Path(r"C:\LDPlayer\LDPlayer14\vms\operationRecords")
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -88,14 +92,45 @@ def run_adb(arguments: list[str], serial: str | None = None, timeout: float = AD
     if serial:
         command += ["-s", serial]
     command += arguments
-    try:
-        result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as error:
-        raise SystemExit("ADB ไม่ตอบสนองภายใน 5 วินาที กรุณาเปิด ADB debugging ใน LDPlayer") from error
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(detail or f"ADB exit code {result.returncode}")
-    return result.stdout
+    label = " ".join(arguments[:3])
+    last_error: BaseException | None = None
+    for attempt in range(1, ADB_RETRIES + 1):
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+            if result.returncode == 0:
+                if attempt > 1:
+                    print(f"ADB กลับมาเชื่อมต่อสำเร็จ: {label} (รอบ {attempt}/{ADB_RETRIES})")
+                return result.stdout
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            last_error = RuntimeError(detail or f"ADB exit code {result.returncode}")
+        except subprocess.TimeoutExpired as error:
+            last_error = error
+            print(
+                f"ADB timeout ขณะรัน '{label}' หลัง {timeout:g} วินาที "
+                f"(รอบ {attempt}/{ADB_RETRIES})"
+            )
+        if attempt >= ADB_RETRIES:
+            break
+        adb = str(find_adb_path())
+        try:
+            if attempt == 1:
+                reconnect = [adb]
+                if serial:
+                    reconnect += ["-s", serial]
+                reconnect += ["reconnect"]
+                subprocess.run(reconnect, capture_output=True, timeout=3, check=False)
+                print("กำลัง reconnect ADB แล้วลองใหม่...")
+            else:
+                subprocess.run([adb, "kill-server"], capture_output=True, timeout=3, check=False)
+                subprocess.run([adb, "start-server"], capture_output=True, timeout=5, check=False)
+                print("รีสตาร์ต ADB server แล้วลองใหม่...")
+        except subprocess.TimeoutExpired:
+            print("คำสั่งกู้คืน ADB timeout — จะลองคำสั่งหลักอีกครั้ง")
+        time.sleep(0.25)
+    detail = str(last_error) if last_error else "ไม่ทราบสาเหตุ"
+    raise RuntimeError(
+        f"ADB ไม่ตอบสนองหลังลอง {ADB_RETRIES} รอบขณะรัน '{label}': {detail}"
+    )
 
 
 def adb_devices() -> list[tuple[str, str]]:
@@ -697,6 +732,18 @@ def save_action_template(source: str) -> None:
     print(f"บันทึกภาพต้นแบบปุ่ม action แล้ว: {ACTION_TEMPLATE}")
 
 
+def save_claim_template(source: str) -> None:
+    image = cv2.imread(source)
+    if image is None:
+        raise SystemExit(f"อ่านภาพปุ่ม Claim ไม่ได้: {source}")
+    if image.shape[0] < 30 or image.shape[1] < 80:
+        raise SystemExit("ภาพปุ่ม Claim มีขนาดเล็กเกินไป")
+    if not cv2.imwrite(str(CLAIM_TEMPLATE), image):
+        raise SystemExit("บันทึกภาพต้นแบบ Claim ไม่สำเร็จ")
+    cached_text_template.cache_clear()
+    print(f"บันทึกภาพต้นแบบปุ่ม Claim แล้ว: {CLAIM_TEMPLATE}")
+
+
 def card_boxes(frame: np.ndarray, grid: list[float]) -> list[tuple[int, int, int, int]]:
     screen_h, screen_w = frame.shape[:2]
     x, y, w, h = grid
@@ -842,6 +889,130 @@ def find_button(
 
 def find_cancel_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
     return find_button(frame, grid, CANCEL_TEMPLATE, threshold=0.75)
+
+
+def find_claim_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
+    """Find the Claim text and require a substantial green button background."""
+    box = find_button(frame, grid, CLAIM_TEMPLATE, threshold=0.72)
+    if box is None:
+        return None
+    x1, y1, x2, y2 = box
+    button = frame[y1:y2, x1:x2]
+    if button.size == 0:
+        return None
+    hsv = cv2.cvtColor(button, cv2.COLOR_BGR2HSV)
+    green = (
+        (hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 90) &
+        (hsv[:, :, 1] > 70) & (hsv[:, :, 2] > 65)
+    )
+    return box if float(green.mean()) >= 0.18 else None
+
+
+def _normalized_glyph(mask: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = box
+    glyph = mask[y:y + h, x:x + w]
+    return cv2.resize(glyph, (24, 32), interpolation=cv2.INTER_NEAREST)
+
+
+def _glyph_match(
+    mask: np.ndarray,
+    lhs: tuple[int, int, int, int],
+    rhs: tuple[int, int, int, int],
+) -> tuple[bool, float, float]:
+    """Compare printed digits robustly despite per-position anti-aliasing."""
+    lx, ly, lw, lh = lhs
+    rx, ry, rw, rh = rhs
+    raw_a = mask[ly:ly + lh, lx:lx + lw]
+    raw_b = mask[ry:ry + rh, rx:rx + rw]
+    contours_a, _ = cv2.findContours(raw_a, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_b, _ = cv2.findContours(raw_b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours_a or not contours_b:
+        return False, 0.0, float("inf")
+    contour_a = max(contours_a, key=cv2.contourArea)
+    contour_b = max(contours_b, key=cv2.contourArea)
+    shape_distance = float(cv2.matchShapes(contour_a, contour_b, cv2.CONTOURS_MATCH_I1, 0.0))
+    a = _normalized_glyph(mask, lhs)
+    b = _normalized_glyph(mask, rhs)
+    pixel_similarity = float(
+        1.0 - np.mean(np.abs(a.astype(np.float32) - b.astype(np.float32))) / 255.0
+    )
+    return shape_distance <= 1.0 and pixel_similarity >= 0.72, pixel_similarity, shape_distance
+
+
+def find_completed_counter(frame: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Find a top-screen N/N counter by comparing glyphs around its slash."""
+    screen_h, screen_w = frame.shape[:2]
+    # This reward counter occupies a stable HUD slot. Searching the whole top
+    # band caused unrelated scores/text with diagonal strokes to look like N/N.
+    hud_x1, hud_x2 = int(screen_w * 0.34), int(screen_w * 0.52)
+    hud_y1, hud_y2 = int(screen_h * 0.08), int(screen_h * 0.22)
+    roi_h = max(1, hud_y2)
+    roi = frame[:roi_h]
+    mask = white_text_mask(roi)
+    # Join outlines within each printed glyph without merging adjacent digits.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask)
+    components: list[tuple[int, int, int, int]] = []
+    min_h = max(10, int(screen_h * 0.014))
+    max_h = max(min_h + 1, int(screen_h * 0.09))
+    for x, y, w, h, area in stats[1:count]:
+        if min_h <= h <= max_h and area >= max(8, h // 2) and w <= h * 1.25:
+            components.append((int(x), int(y), int(w), int(h)))
+
+    for slash in components:
+        sx, sy, sw, sh = slash
+        slash_center_x = sx + sw / 2
+        slash_center_y = sy + sh / 2
+        if not (hud_x1 <= slash_center_x <= hud_x2 and hud_y1 <= slash_center_y <= hud_y2):
+            continue
+        if not (0.22 <= sw / sh <= 0.75):
+            continue
+        points = np.column_stack(np.where(mask[sy:sy + sh, sx:sx + sw] > 0))
+        if len(points) < 6:
+            continue
+        # A slash slopes from top-right to bottom-left in image coordinates.
+        if float(np.corrcoef(points[:, 0], points[:, 1])[0, 1]) > -0.35:
+            continue
+        center_y = sy + sh / 2
+        peers = [
+            item for item in components
+            if item != slash
+            and abs((item[1] + item[3] / 2) - center_y) <= sh * 0.28
+            and 0.65 <= item[3] / sh <= 1.35
+        ]
+        left = sorted(
+            (item for item in peers if item[0] + item[2] <= sx and sx - (item[0] + item[2]) <= sh * 2.8),
+            key=lambda item: item[0],
+        )
+        right = sorted(
+            (item for item in peers if item[0] >= sx + sw and item[0] - (sx + sw) <= sh * 2.8),
+            key=lambda item: item[0],
+        )
+        # Support one- and multi-digit values, but reject unrelated long text.
+        if not left or len(left) != len(right) or len(left) > 3:
+            continue
+        similarities = []
+        shape_distances = []
+        all_matched = True
+        for lhs, rhs in zip(left, right):
+            matched, similarity, shape_distance = _glyph_match(mask, lhs, rhs)
+            similarities.append(similarity)
+            shape_distances.append(shape_distance)
+            if not matched:
+                all_matched = False
+                break
+        if not all_matched or len(similarities) != len(left):
+            continue
+        x1 = max(0, min(item[0] for item in left) - int(sh * 2.2))
+        y1 = max(0, min(item[1] for item in left + [slash] + right) - int(sh * 0.55))
+        x2 = min(screen_w, max(item[0] + item[2] for item in left + [slash] + right) + int(sh * 0.55))
+        y2 = min(roi_h, max(item[1] + item[3] for item in left + [slash] + right) + int(sh * 0.55))
+        print(
+            f"พบตัวนับเลขเท่ากัน ความเหมือน {min(similarities) * 100:.1f}% "
+            f"(shape {max(shape_distances):.3f})"
+        )
+        return x1, y1, x2, y2
+    return None
 
 
 def find_close_button(frame: np.ndarray, grid: list[float]) -> tuple[int, int, int, int] | None:
@@ -1084,6 +1255,7 @@ def run(
     macro_file: str | None,
     macro_once: bool,
     action_enabled: bool,
+    completed_counter_enabled: bool,
 ) -> None:
     if not CONFIG.exists():
         raise SystemExit("ยังไม่ได้ตั้งพื้นที่ กรุณารัน: python detector.py --calibrate")
@@ -1124,6 +1296,13 @@ def run(
     close_last_tap, close_tap_attempts = 0.0, 0
     action_latched = False
     cancel_latched = False
+    cancel_last_tap, cancel_tap_attempts = 0.0, 0
+    completed_counter_latched = False
+    waiting_for_claim = False
+    claim_clicked = False
+    claim_started_at = 0.0
+    claim_last_tap = 0.0
+    claim_tap_attempts = 0
     if backend_name == "screen":
         pyautogui.FAILSAFE = True
         print("เริ่ม screen backend — เลื่อนเมาส์ไปมุมซ้ายบนเพื่อหยุดฉุกเฉิน หรือกด Q")
@@ -1135,6 +1314,60 @@ def run(
         frame = backend.grab()
         if macro and clip_recorder:
             clip_recorder.record(frame, macro.paused.is_set())
+
+        if waiting_for_claim:
+            # Claim flow has exclusive priority. X, Cancel and Confirm must not
+            # run until the Claim tap has succeeded and the button disappears.
+            if macro:
+                macro.observe_scene(True)
+            candidate_slot, stable_frames = None, 0
+            claim = find_claim_button(frame, grid)
+            now = time.time()
+            if claim:
+                if click and claim_tap_attempts < 5 and now - claim_last_tap >= 0.65:
+                    x1, y1, x2, y2 = claim
+                    backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
+                    claim_clicked = True
+                    claim_tap_attempts += 1
+                    claim_last_tap = now
+                    last_click = now
+                    print(f"คลิกปุ่ม Claim ครั้งที่ {claim_tap_attempts}/5")
+                time.sleep(interval)
+                continue
+            if claim_clicked:
+                waiting_for_claim = False
+                print("Claim หายแล้ว — เปิดการตรวจ X, Cancel และ Confirm ตามปกติ")
+                time.sleep(interval)
+                continue
+            if now - claim_started_at < 6.0:
+                time.sleep(interval)
+                continue
+            waiting_for_claim = False
+            print("ไม่พบ Claim ภายใน 6 วินาที — ยกเลิกโหมดบล็อกปุ่ม")
+            time.sleep(interval)
+            continue
+
+        completed_counter = find_completed_counter(frame) if completed_counter_enabled else None
+        if completed_counter:
+            if not completed_counter_latched:
+                completed_counter_latched = True
+                x1, y1, x2, y2 = completed_counter
+                if click:
+                    backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
+                    print("คลิกตัวนับที่เลขหน้า/หลังเท่ากัน — รอปุ่ม Claim")
+                else:
+                    print("พบตัวนับที่เลขหน้า/หลังเท่ากัน (dry-run)")
+                waiting_for_claim = True
+                claim_clicked = False
+                claim_started_at = time.time()
+                claim_last_tap = 0.0
+                claim_tap_attempts = 0
+                if macro:
+                    macro.observe_scene(True)
+            time.sleep(interval)
+            continue
+        completed_counter_latched = False
+
         upgrade_visible = is_upgrade_window(frame)
         action = (
             find_action_button(frame)
@@ -1197,18 +1430,34 @@ def run(
                 macro.observe_scene(True)
             candidate_slot, stable_frames = None, 0
             if not cancel_latched:
-                x1, y1, x2, y2 = cancel
-                if click:
-                    backend.tap((x1 + x2) // 2, (y1 + y2) // 2)
-                    print("คลิกปุ่ม Cancel")
-                last_click = time.time()
                 cancel_latched = True
+                cancel_last_tap, cancel_tap_attempts = 0.0, 0
+            now = time.time()
+            if (
+                click
+                and cancel_tap_attempts < CANCEL_MAX_ATTEMPTS
+                and now - cancel_last_tap >= CANCEL_RETRY_SECONDS
+            ):
+                x1, y1, x2, y2 = cancel
+                tap_x, tap_y = (x1 + x2) // 2, (y1 + y2) // 2
+                backend.tap(tap_x, tap_y)
+                cancel_tap_attempts += 1
+                cancel_last_tap = now
+                last_click = now
+                print(
+                    f"คลิกปุ่ม Cancel ครั้งที่ {cancel_tap_attempts}/{CANCEL_MAX_ATTEMPTS} "
+                    f"ตำแหน่ง ({tap_x}, {tap_y})"
+                )
+            elif not click and cancel_tap_attempts == 0:
+                cancel_tap_attempts = 1
+                print("พบปุ่ม Cancel (dry-run)")
             if finish_recording:
                 time.sleep(POST_PAUSE_RECORD_SECONDS)
                 clip_recorder.finish("cancel")
             time.sleep(interval)
             continue
         cancel_latched = False
+        cancel_last_tap, cancel_tap_attempts = 0.0, 0
 
         confirm = find_confirm_button(frame, grid)
         if confirm and time.time() - last_click > 0.30:
@@ -1322,6 +1571,7 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ตรวจจับการ์ดที่ต่างจากการ์ดส่วนใหญ่")
+    parser.add_argument("--ui", action="store_true", help="เปิดหน้าต่างควบคุมแบบ GUI")
     parser.add_argument("--calibrate", action="store_true", help="เลือกกรอบรวมของการ์ด 6 ช่อง")
     parser.add_argument("--backend", choices=("screen", "adb"), help="แหล่งภาพและวิธีคลิก")
     parser.add_argument("--monitor", type=int, help="หมายเลขจอที่ต้องการใช้ เช่น 1 หรือ 2")
@@ -1335,10 +1585,16 @@ def main() -> None:
     parser.add_argument("--close-template", metavar="IMAGE", help="บันทึกภาพปุ่ม X เป็นต้นแบบ")
     parser.add_argument("--upgrade-window-template", metavar="IMAGE", help="บันทึกหน้าต่าง Buy Upgrades ที่ต้องยกเว้นปุ่ม X")
     parser.add_argument("--action-template", metavar="IMAGE", help="บันทึกภาพปุ่ม action ที่ต้องตรวจและกด")
+    parser.add_argument("--claim-template", metavar="IMAGE", help="บันทึกภาพปุ่ม Claim เป็นต้นแบบ")
     parser.add_argument(
         "--no-action",
         action="store_true",
         help="ปิดการตรวจและกดปุ่ม action ชั่วคราว",
+    )
+    parser.add_argument(
+        "--no-counter",
+        action="store_true",
+        help="ปิดการตรวจตัวนับเลขเท่ากันและปุ่ม Claim ชั่วคราว",
     )
     parser.add_argument("--dry-run", action="store_true", help="แสดงผลอย่างเดียว ไม่คลิกจริง")
     parser.add_argument("--no-preview", action="store_true", help="ไม่แสดงหน้าต่างตรวจสอบ")
@@ -1351,7 +1607,10 @@ def main() -> None:
     parser.add_argument("--reset-learning", action="store_true", help="ล้างข้อมูลเรียนรู้ทั้งหมด")
     parser.add_argument("--learning-stats", action="store_true", help="แสดงจำนวนตัวอย่างที่เรียนรู้")
     args = parser.parse_args()
-    if args.list_monitors:
+    if args.ui:
+        from detector_ui import main as ui_main
+        ui_main()
+    elif args.list_monitors:
         list_monitors()
     elif args.list_adb_devices:
         list_adb_devices()
@@ -1369,6 +1628,8 @@ def main() -> None:
         save_upgrade_window_template(args.upgrade_window_template)
     elif args.action_template:
         save_action_template(args.action_template)
+    elif args.claim_template:
+        save_claim_template(args.claim_template)
     elif args.calibrate:
         calibrate(args.backend or "screen", args.monitor or 1, args.adb_device)
     else:
@@ -1384,6 +1645,7 @@ def main() -> None:
             args.macro_file,
             args.macro_once,
             not args.no_action,
+            not args.no_counter,
         )
 
 
