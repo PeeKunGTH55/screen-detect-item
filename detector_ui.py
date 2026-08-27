@@ -17,6 +17,32 @@ ADB = Path(r"C:\LDPlayer\LDPlayer14\adb.exe")
 MACRO_DIR = Path(r"C:\LDPlayer\LDPlayer14\vms\operationRecords")
 
 
+def build_detector_command(
+    device: str = "",
+    macro: str = "",
+    action: bool = True,
+    counter: bool = True,
+    learning: bool = True,
+    preview: bool = True,
+    dry_run: bool = False,
+    macro_once: bool = False,
+) -> list[str]:
+    command = [sys.executable, "-u", str(DETECTOR)]
+    options = (
+        (["--adb-device", device] if device else []),
+        (["--macro-file", macro] if macro else []),
+        ([] if action else ["--no-action"]),
+        ([] if counter else ["--no-counter"]),
+        ([] if learning else ["--no-learning"]),
+        ([] if preview else ["--no-preview"]),
+        (["--dry-run"] if dry_run else []),
+        (["--macro-once"] if macro_once else []),
+    )
+    for option in options:
+        command.extend(option)
+    return command
+
+
 class DetectorUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -108,24 +134,16 @@ class DetectorUI:
             self.macro.current(0)
 
     def build_command(self) -> list[str]:
-        command = [sys.executable, "-u", str(DETECTOR)]
-        if self.device.get():
-            command += ["--adb-device", self.device.get()]
-        if self.macro.get():
-            command += ["--macro-file", self.macro.get()]
-        if not self.action.get():
-            command.append("--no-action")
-        if not self.counter.get():
-            command.append("--no-counter")
-        if not self.learning.get():
-            command.append("--no-learning")
-        if not self.preview.get():
-            command.append("--no-preview")
-        if self.dry_run.get():
-            command.append("--dry-run")
-        if self.macro_once.get():
-            command.append("--macro-once")
-        return command
+        return build_detector_command(
+            device=self.device.get(),
+            macro=self.macro.get(),
+            action=self.action.get(),
+            counter=self.counter.get(),
+            learning=self.learning.get(),
+            preview=self.preview.get(),
+            dry_run=self.dry_run.get(),
+            macro_once=self.macro_once.get(),
+        )
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
