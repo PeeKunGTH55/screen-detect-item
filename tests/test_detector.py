@@ -28,14 +28,15 @@ class DetectionTests(unittest.TestCase):
         template = cv2.imread(str(detector.CONFIRM_TEMPLATE))
         frame = np.zeros((900, 1600, 3), np.uint8)
         h, w = template.shape[:2]
-        frame[650:650 + h, 630:630 + w] = template
+        # Deliberately place it outside the calibrated card-relative ROI.
+        frame[650:650 + h, 20:20 + w] = template
         self.assertIsNotNone(detector.find_confirm_button(frame, GRID))
 
         hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
         green = (hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 85) & (hsv[:, :, 1] > 80)
         hsv[:, :, 0][green] = 95
         blue_template = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-        frame[650:650 + h, 630:630 + w] = blue_template
+        frame[650:650 + h, 20:20 + w] = blue_template
         self.assertIsNone(detector.find_confirm_button(frame, GRID))
 
     def test_card_scene_supports_six_and_five_cards(self) -> None:

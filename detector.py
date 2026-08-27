@@ -522,20 +522,19 @@ def cached_action_template(path_string: str):
 
 
 def find_button(
-    frame: np.ndarray, grid: list[float], template_path: Path, threshold: float = 0.82
+    frame: np.ndarray, _grid: list[float], template_path: Path, threshold: float = 0.82
 ) -> tuple[int, int, int, int] | None:
-    """Find button text in a half-size popup ROI using cached templates."""
+    """Find button text across the screen using cached half-size templates.
+
+    ``_grid`` remains in the signature for compatibility, but button detection
+    no longer depends on the calibrated card area.
+    """
     data = cached_text_template(str(template_path)) if template_path.exists() else None
     if data is None:
         return None
     template_h, template_w, crop_left, crop_top, variants = data
     screen_h, screen_w = frame.shape[:2]
-    gx, gy, gw, gh = grid
-    gx, gy, gw, gh = gx * screen_w, gy * screen_h, gw * screen_w, gh * screen_h
-    x1 = max(0, int(gx - gw * 0.25))
-    y1 = max(0, int(gy - gh * 0.25))
-    x2 = min(screen_w, int(gx + gw * 1.25))
-    y2 = min(screen_h, int(gy + gh * 1.15))
+    x1, y1, x2, y2 = 0, 0, screen_w, screen_h
     search = frame[y1:y2, x1:x2]
     search_mask = cv2.resize(
         white_text_mask(search), None,
